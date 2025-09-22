@@ -1,0 +1,14 @@
+/api/tasks                        TaskListR          GET POST
+/api/tasks/#TaskId                TaskR              GET PATCH
+/api/tasks/#TaskId/cancel         TaskCancelR        POST
+/api/tasks/#TaskId/messages       TaskMessageR       POST
+/api/tasks/#TaskId/status-stream  TaskStatusStreamR  GET
+/api/settings                     SettingsR          GET PUT
+/api/prompts                      PromptListR        GET
+/api/prompts/#Text                PromptR            GET PUT
+/api/prompts/#Text/reset          PromptResetR       POST
+/api/prompts/#Text/revisions      PromptRevisionsR   GET
+/api/snapshot                     SnapshotR          GET
+/api/preview/#TaskId/ping         PreviewPingR       POST
+/static                           StaticR            Static getStatic
+/                                 FrontendIndexR     GET
