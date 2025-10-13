@@ -1,6 +1,7 @@
 /dist-newstyle/
 backend/dist/
 backend/.stack-work/
+frontend/src/Generated
 frontend/node_modules/
 frontend/dist/
 result

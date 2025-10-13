@@ -29,6 +29,7 @@ insertSamples now args = do
         , taskRepoRoot = "."
         , taskBranch = "main"
         , taskFeatureBranch = Nothing
+        , taskTestCommandOverride = Nothing
         , taskPreviewUrl = Nothing
         , taskPreviewStatus = PreviewOffline
         , taskCreatedAt = now

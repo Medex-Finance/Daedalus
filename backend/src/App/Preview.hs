@@ -10,7 +10,8 @@ module App.Preview
 
 import App.Foundation (App(..))
 import App.Models
-import App.Types (AppSettingsDTO(..), ArtifactKind(..), PreviewStatus(..))
+import App.ProcessDispatcher (launchServiceInDir)
+import App.Types (AgentRole(..), AppSettingsDTO(..), ArtifactKind(..), PreviewStatus(..), WorkflowStep(..))
 import App.Worktree (WorktreeContext(..), locateWorktree)
 import Control.Concurrent.STM (readTVarIO)
 import Control.Exception (SomeException, try)
@@ -25,11 +26,9 @@ import Database.Persist.Sql (SqlPersistT, runSqlPool)
 import Network.HTTP.Client (Manager, httpLbs, parseRequest, responseStatus)
 import Network.HTTP.Types.Status (status200)
 import System.Directory (createDirectoryIfMissing)
-import System.Environment (getEnvironment)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>))
-import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode)
-import Text.Read (readMaybe)
+import System.Process (ProcessHandle, getPid, proc, readCreateProcessWithExitCode)
 
 previewBasePort :: Int
 previewBasePort = 43000
@@ -42,7 +41,7 @@ previewUrlForTask taskId =
   T.pack $ "http://localhost:" <> show (previewPortForTask taskId)
 
 startPreview :: App -> TaskId -> IO (Either Text Text)
-startPreview App { appConnPool, appSettingsVar } taskId = do
+startPreview app@App { appConnPool, appSettingsVar } taskId = do
   mTask <- runSqlPool (get taskId) appConnPool
   case mTask of
     Nothing -> pure (Left "Task not found")
@@ -57,7 +56,7 @@ startPreview App { appConnPool, appSettingsVar } taskId = do
           let port = previewPortForTask taskId
               url = previewUrlForTask taskId
           worktree <- locateWorktree (T.unpack (taskRepoRoot task)) taskId
-          launchResult <- launchPreviewProcess worktree port cmd
+          launchResult <- launchPreviewProcess app taskId worktree port cmd
           case launchResult of
             Left err -> failWith err
             Right (pid, logPath) -> do
@@ -113,41 +112,26 @@ storeLaunchArtifact label tid info port pid logPath now =
     , artifactCreatedAt = now
     }
 
-launchPreviewProcess :: WorktreeContext -> Int -> Text -> IO (Either Text (Int, FilePath))
-launchPreviewProcess WorktreeContext { wtRoot } port commandText = do
-  env <- getEnvironment
+launchPreviewProcess :: App -> TaskId -> WorktreeContext -> Int -> Text -> IO (Either Text (Int, FilePath))
+launchPreviewProcess app taskId WorktreeContext { wtRoot } port commandText = do
   timestamp <- getCurrentTime
   createDirectoryIfMissing True previewDir
   TIO.appendFile logPath $ T.pack ("\n=== Preview launch " <> show timestamp <> " ===\n")
-  let processEnv = mergeEnv
+  let envExtras =
         [ ("PORT", show port)
         , ("PREVIEW_PORT", show port)
         ]
-        env
-      script = T.unlines
-        [ "set -euo pipefail"
-        , "mkdir -p .preview"
-        , "(" <> commandText <> ") >> .preview/preview.log 2>&1 &"
-        , "echo $!"
-        ]
-  (code, out, err) <- readCreateProcessWithExitCode (proc "bash" ["-lc", T.unpack script])
-    { cwd = Just wtRoot
-    , env = Just processEnv
-    } ""
-  case code of
-    ExitSuccess ->
-      case readMaybe (T.unpack . T.strip $ T.pack out) of
-        Nothing -> pure $ Left "Unable to parse preview PID"
-        Just pid -> pure $ Right (pid, logPath)
-    _ -> pure . Left $ T.strip (T.pack err)
+  result <- launchServiceInDir app taskId StepPreview AgentRoleImplementer "preview" wtRoot logPath envExtras commandText
+  case result of
+    Left err -> pure (Left err)
+    Right handle -> do
+      mPid <- getPid handle
+      case mPid of
+        Nothing -> pure $ Left "Unable to determine preview PID"
+        Just pid -> pure $ Right (fromIntegral pid, logPath)
   where
     previewDir = wtRoot </> ".preview"
     logPath = previewDir </> "preview.log"
-
-mergeEnv :: [(String, String)] -> [(String, String)] -> [(String, String)]
-mergeEnv additions base = additions ++ filter ((`notElem` keys) . fst) base
-  where
-    keys = fmap fst additions
 
 teardownPreview :: ConnectionPool -> TaskId -> IO ()
 teardownPreview pool taskId = do

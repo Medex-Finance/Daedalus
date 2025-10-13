@@ -8,6 +8,9 @@
 module App.Foundation
   ( App(..)
   , AgentRuntime(..)
+  , WorkerRuntimeState(..)
+  , WorkerMetrics(..)
+  , WorkerAssignments
   , resourcesApp
   , Route(..)
   , Handler
@@ -24,8 +27,9 @@ import App.Types (AgentRole, AppSettingsDTO, PromptTemplateDTO, WorkflowStep)
 import Control.Concurrent.STM (TVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
+import Data.Set (Set)
 import Data.Text (Text)
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime)
 import Database.Persist.Sql (ConnectionPool, SqlBackend, runSqlPool)
 import Network.HTTP.Client (Manager, newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
@@ -46,6 +50,33 @@ data AgentRuntime = AgentRuntime
   , agentStartedAt :: UTCTime
   }
 
+data WorkerRuntimeState
+  = WorkerRuntimeIdle
+      { workerRuntimeIdleSince :: UTCTime
+      }
+  | WorkerRuntimeBusy
+      { workerRuntimeTaskId :: TaskId
+      , workerRuntimeStep :: WorkflowStep
+      , workerRuntimeStartedAt :: UTCTime
+      }
+  deriving (Show, Eq)
+
+data WorkerMetrics = WorkerMetrics
+  { workerMetricsCurrentTask :: Maybe TaskId
+  , workerMetricsCurrentStep :: Maybe WorkflowStep
+  , workerMetricsStartedAt :: Maybe UTCTime
+  , workerMetricsLastTask :: Maybe TaskId
+  , workerMetricsLastStep :: Maybe WorkflowStep
+  , workerMetricsLastDuration :: Maybe NominalDiffTime
+  , workerMetricsLastSuccess :: Maybe Bool
+  , workerMetricsLastError :: Maybe Text
+  , workerMetricsAssignments :: Int
+  , workerMetricsBusySeconds :: NominalDiffTime
+  }
+  deriving (Show, Eq)
+
+type WorkerAssignments = Map TaskId Int
+
 -- | Application foundation shared across handlers.
 data App = App
   { appConnPool :: ConnectionPool
@@ -56,8 +87,16 @@ data App = App
   , appStatusHub :: StatusHub
   , appAgentRegistry :: TVar (Map TaskId AgentRuntime)
   , appHeartbeatVar :: TVar (Map TaskId UTCTime)
+  , appWorkerStates :: TVar (Map Int WorkerRuntimeState)
+  , appWorkerAssignments :: TVar WorkerAssignments
+  , appPausedTasks :: TVar (Set TaskId)
+  , appSnoozedTasks :: TVar (Map TaskId UTCTime)
+  , appWorkerMetrics :: TVar (Map Int WorkerMetrics)
+  , appRetryHints :: TVar (Map TaskId (Map WorkflowStep [Text]))
+  , appRetryCounters :: TVar (Map TaskId Int)
   , appStatic :: Static
   , appIndexFile :: FilePath
+  , appWorkerCount :: Int
   }
 
 instance Yesod App where

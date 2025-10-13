@@ -36,6 +36,14 @@ promptSeeds =
           "Always add or update end-to-end tests before implementation.",
           "Describe applied changes and ensure tests pass." ]
     )
+  , ( "pm_verification"
+    , "Project manager spec verification"
+    , T.unlines
+        [ "You are verifying that the implementation satisfies the original requirements.",
+          "Carefully compare the current diff and artifacts against the task description and design plan.",
+          "If the work is complete and correct, exit successfully with a concise approval summary.",
+          "If gaps remain, exit with a failure status and list the missing items so implementation can try again." ]
+    )
   , ( "qa_reviewer"
     , "QA and security reviewer"
     , T.unlines

@@ -51,6 +51,7 @@ Task
     repoRoot Text
     branch Text
     featureBranch Text Maybe
+    testCommandOverride Text Maybe
     previewUrl Text Maybe
     previewStatus PreviewStatus
     createdAt UTCTime default=CURRENT_TIMESTAMP

@@ -19,6 +19,7 @@ import Control.Monad.Logger (runStdoutLoggingT)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import Database.Persist.Sql (runSqlPool)
 import Database.Persist.Sqlite (createSqlitePool)
@@ -26,6 +27,7 @@ import Network.Wai (Application)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
+import Text.Read (readMaybe)
 import Yesod (mkYesodDispatch, toWaiAppPlain)
 import Yesod.Static (static)
 
@@ -44,7 +46,16 @@ makeApp = do
   manager <- makeHttpManager
   agentRegistry <- newTVarIO Map.empty
   heartbeatVar <- newTVarIO Map.empty
+  workerStatesVar <- newTVarIO Map.empty
+  workerAssignmentsVar <- newTVarIO Map.empty
+  pausedTasksVar <- newTVarIO Set.empty
+  snoozedTasksVar <- newTVarIO Map.empty
+  workerMetricsVar <- newTVarIO Map.empty
+  retryHintsVar <- newTVarIO Map.empty
+  retryCountersVar <- newTVarIO Map.empty
   staticDirEnv <- lookupEnv "STATIC_DIR"
+  workerCountEnv <- lookupEnv "WORKER_COUNT"
+  let workerCount = fromMaybe 3 (workerCountEnv >>= readMaybe)
   let candidateStaticDir = fromMaybe "../frontend/dist" staticDirEnv
   candidateExists <- doesDirectoryExist candidateStaticDir
   let fallbackStaticDir = "static"
@@ -61,8 +72,16 @@ makeApp = do
         , appStatusHub = hub
         , appAgentRegistry = agentRegistry
         , appHeartbeatVar = heartbeatVar
+        , appWorkerStates = workerStatesVar
+        , appWorkerAssignments = workerAssignmentsVar
+        , appPausedTasks = pausedTasksVar
+        , appSnoozedTasks = snoozedTasksVar
+        , appWorkerMetrics = workerMetricsVar
+        , appRetryHints = retryHintsVar
+        , appRetryCounters = retryCountersVar
         , appStatic = staticSite
         , appIndexFile = indexFile
+        , appWorkerCount = workerCount
         }
   startOrchestrator appFoundation
   pure appFoundation

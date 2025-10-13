@@ -19,6 +19,7 @@ library orchestrator-types
       base >=4.14 && <4.20
     , aeson >=2.1
     , aeson-typescript >=0.6
+    , elm-bridge
     , persistent
     , persistent-template
     , template-haskell
@@ -37,6 +38,8 @@ library
     , App.Worktree
     , App.Preview
     , App.StatusStream
+    , App.ProcessDispatcher
+    , App.Direnv
     , App.API
     , App.Queue
     , App.Logging
@@ -100,6 +103,7 @@ executable generate-types
       base
     , orchestrator-types
     , aeson-typescript
+    , elm-bridge
     , text
   default-language:  Haskell2010
 
@@ -116,3 +120,26 @@ executable seed
     , text
     , time
   default-language:  Haskell2010
+
+test-suite integration
+  type:              exitcode-stdio-1.0
+  hs-source-dirs:    test
+  main-is:           Spec.hs
+  other-modules:     OrchestratorSpec
+  default-language:  Haskell2010
+  ghc-options:       -Wall
+  build-depends:
+      base
+    , orchestrator-backend
+    , orchestrator-types
+    , aeson
+    , containers
+    , hspec
+    , monad-logger
+    , persistent
+    , persistent-sqlite
+    , process
+    , stm
+    , text
+    , time
+    , yesod-static

@@ -4,24 +4,31 @@ module App.Queue
   ( AppQueue(..)
   , QueueMessage(..)
   , newQueue
-  , enqueue
-  , dequeue
+  , enqueueGlobal
+  , enqueueForWorker
+  , dequeueForWorker
   , queueSize
   ) where
 
 import App.Models (TaskId)
 import App.Types (WorkflowStep)
 import Control.Concurrent.STM
-  ( TQueue
+  ( STM
+  , TQueue
   , TVar
   , atomically
   , modifyTVar'
   , newTQueue
   , newTVar
   , readTQueue
+  , readTVar
   , readTVarIO
+  , tryReadTQueue
   , writeTQueue
+  , writeTVar
   )
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 
 -- | Messages processed by the orchestrator queue.
 data QueueMessage
@@ -29,29 +36,58 @@ data QueueMessage
   | QueueAdvance TaskId WorkflowStep
   deriving (Show, Eq)
 
--- | Simple STM-backed FIFO queue with depth tracking.
+-- | Queue structure that supports worker-specific routing while
+-- maintaining a global backlog depth.
 data AppQueue = AppQueue
-  { queueInner :: TQueue QueueMessage
+  { queueGlobal :: TQueue QueueMessage
   , queueDepthVar :: TVar Int
+  , queueWorkerQueues :: TVar (Map Int (TQueue QueueMessage))
   }
 
 newQueue :: IO AppQueue
 newQueue = atomically $ do
-  q <- newTQueue
+  globalQ <- newTQueue
   depthVar <- newTVar 0
-  pure AppQueue { queueInner = q, queueDepthVar = depthVar }
+  workerMap <- newTVar Map.empty
+  pure AppQueue
+    { queueGlobal = globalQ
+    , queueDepthVar = depthVar
+    , queueWorkerQueues = workerMap
+    }
 
-enqueue :: AppQueue -> QueueMessage -> IO ()
-enqueue AppQueue { queueInner, queueDepthVar } msg =
+ensureWorkerQueue :: TVar (Map Int (TQueue QueueMessage)) -> Int -> STM (TQueue QueueMessage)
+ensureWorkerQueue queueWorkerQueues workerId = do
+  queues <- readTVar queueWorkerQueues
+  case Map.lookup workerId queues of
+    Just q -> pure q
+    Nothing -> do
+      q <- newTQueue
+      writeTVar queueWorkerQueues (Map.insert workerId q queues)
+      pure q
+
+enqueueGlobal :: AppQueue -> QueueMessage -> IO ()
+enqueueGlobal AppQueue { queueGlobal, queueDepthVar } msg =
   atomically $ do
-    writeTQueue queueInner msg
+    writeTQueue queueGlobal msg
     modifyTVar' queueDepthVar (+ 1)
 
--- | Blocking dequeue used by orchestrator worker.
-dequeue :: AppQueue -> IO QueueMessage
-dequeue AppQueue { queueInner, queueDepthVar } =
+enqueueForWorker :: AppQueue -> Int -> QueueMessage -> IO ()
+enqueueForWorker AppQueue { queueDepthVar, queueWorkerQueues } workerId msg =
   atomically $ do
-    msg <- readTQueue queueInner
+    workerQueue <- ensureWorkerQueue queueWorkerQueues workerId
+    writeTQueue workerQueue msg
+    modifyTVar' queueDepthVar (+ 1)
+
+-- | Blocking dequeue that prefers worker-specific messages if present,
+-- otherwise falls back to the shared global queue.
+dequeueForWorker :: AppQueue -> Int -> IO QueueMessage
+dequeueForWorker AppQueue { queueGlobal, queueDepthVar, queueWorkerQueues } workerId =
+  atomically $ do
+    workerQueue <- ensureWorkerQueue queueWorkerQueues workerId
+    mLocal <- tryReadTQueue workerQueue
+    msg <- case mLocal of
+      Just localMsg -> pure localMsg
+      Nothing -> readTQueue queueGlobal
     modifyTVar' queueDepthVar (max 0 . subtract 1)
     pure msg
 

@@ -9,11 +9,13 @@ module App.AgentGateway
   , defaultGateway
   ) where
 
+import App.Direnv (wrapWithDirenv)
 import App.Models (TaskId)
 import App.Types
 import Control.Concurrent.Async (async, wait)
 import Control.Exception (IOException, catchJust, displayException, finally, try)
 import Control.Monad (unless)
+import Data.Foldable (for_)
 import Data.Aeson (Value, encode, object, (.=))
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -81,9 +83,11 @@ runCodex AgentInvocation {..} = do
     Left err -> pure $ failureResult err
     Right CommandSelection { csExecutable, csArgs, csEnvExtras } -> do
       envWithCustom <- mergeEnv (csEnvExtras ++ aiEnvironment)
-      let processSpec = (proc csExecutable csArgs)
+      ((execCmd, execArgs, finalEnv), direnvNote) <- wrapWithDirenv aiWorkingDir csExecutable csArgs envWithCustom
+      for_ direnvNote $ \msg -> aiPublish ("[stderr] " <> msg)
+      let processSpec = (proc execCmd execArgs)
             { cwd = aiWorkingDir
-            , env = Just envWithCustom
+            , env = Just finalEnv
             , std_out = CreatePipe
             , std_err = CreatePipe
             , std_in = CreatePipe

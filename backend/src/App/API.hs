@@ -1,11 +1,31 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE NamedFieldPuns #-}
 module App.API where
 
 import App.Foundation
 import App.Models
-import App.Orchestrator (cancelTask, enqueueTask, logEvent, orchestratorSnapshot)
-import App.Preview (recordPreviewPing, teardownPreview)
+import App.Orchestrator
+  ( cancelTask
+  , enqueueTask
+  , enqueueTaskStep
+  , forceRetry
+  , logEvent
+  , orchestratorSnapshot
+  , pauseTask
+  , reassignTask
+  , redirectWorker
+  , resumeTask
+  , resumeTaskAfterMessage
+  , defaultStepForRole
+  , hintStepFor
+  , scheduleTaskSnooze
+  , cancelTaskSnooze
+  , lookupTaskSnooze
+  , taskSummaryFromEntity
+  , withOrigin
+  )
+import App.Preview (recordPreviewPing, startPreview, teardownPreview)
 import App.PromptStore
   ( getPromptTemplate
   , listPromptTemplates
@@ -24,21 +44,27 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
+import Control.Applicative ((<|>))
 import Control.Monad (forever, when)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (Value, object, (.=))
 import qualified Data.Aeson as Aeson
+import Data.List (splitAt)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe)
+import qualified Data.Set as Set
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8)
 import qualified Data.ByteString.Lazy as BL
 import Data.Time.Clock (getCurrentTime)
+import Text.Read (readMaybe)
 import Database.Persist
   ( Entity(..)
+  , Key
   , SelectOpt(..)
+  , entityKey
   , entityVal
   , get
   , insert
@@ -46,8 +72,9 @@ import Database.Persist
   , update
   , (=.)
   , (==.)
+  , (<.)
   )
-import Database.Persist.Sql (fromSqlKey)
+import Database.Persist.Sql (SqlPersistT, fromSqlKey, toSqlKey)
 import Network.HTTP.Types.Status (status400)
 import Yesod
 import Yesod.Core (sendChunkText, sendFlush)
@@ -56,8 +83,11 @@ import Yesod.Core (sendChunkText, sendFlush)
 
 getTaskListR :: Handler Value
 getTaskListR = do
+  app@App { appPausedTasks, appSnoozedTasks } <- getYesod
+  pausedSet <- liftIO $ readTVarIO appPausedTasks
+  snoozedMap <- liftIO $ readTVarIO appSnoozedTasks
   tasks <- runDB $ selectList [] [Desc TaskUpdatedAt]
-  returnJson (fmap taskSummaryFromEntity tasks)
+  returnJson (fmap (taskSummaryFromEntity pausedSet snoozedMap) tasks)
 
 postTaskListR :: Handler Value
 postTaskListR = do
@@ -74,6 +104,7 @@ postTaskListR = do
     , taskRepoRoot = repo
     , taskBranch = branch
     , taskFeatureBranch = Nothing
+    , taskTestCommandOverride = Nothing
     , taskPreviewUrl = Nothing
     , taskPreviewStatus = PreviewOffline
     , taskCreatedAt = now
@@ -84,24 +115,75 @@ postTaskListR = do
     Nothing -> sendResponseStatus status400 (object ["error" .= ("Failed to create task" :: Text)])
     Just task -> do
       liftIO $ enqueueTask app taskId
-      returnJson (taskSummaryFromEntity (Entity taskId task))
+      returnJson (taskSummaryFromEntity Set.empty Map.empty (Entity taskId task))
 
 getTaskR :: TaskId -> Handler Value
 getTaskR taskId = do
+  App {..} <- getYesod
+  defaults <- liftIO $ readTVarIO appSettingsVar
+  pausedSet <- liftIO $ readTVarIO appPausedTasks
+  snoozedMap <- liftIO $ readTVarIO appSnoozedTasks
   mTask <- runDB $ get taskId
   case mTask of
     Nothing -> notFound
     Just task -> do
       runs <- runDB $ selectList [TaskRunTaskId ==. taskId] [Desc TaskRunOrdinal]
-      events <- runDB $ selectList [StatusEventTaskId ==. taskId] [Desc StatusEventCreatedAt]
+      (eventPage, nextCursor) <- runDB $ fetchEventPage taskId Nothing
       artifacts <- runDB $ selectList [ArtifactTaskId ==. taskId] [Desc ArtifactCreatedAt]
+      let overrideCmd = taskTestCommandOverride task
+          effectiveCmd = fromMaybe (settingsTestCommand defaults) overrideCmd
       let detail = TaskDetail
-            { taskDetailSummary = taskSummaryFromEntity (Entity taskId task)
+            { taskDetailSummary = taskSummaryFromEntity pausedSet snoozedMap (Entity taskId task)
             , taskDetailRuns = fmap taskRunToInfo runs
-            , taskDetailEvents = fmap statusEventToDTO events
+            , taskDetailEvents = fmap statusEventToDTO eventPage
             , taskDetailArtifacts = fmap artifactToDTO artifacts
+            , taskDetailTestCommand = effectiveCmd
+            , taskDetailTestCommandOverride = overrideCmd
+            , taskDetailIsPaused = Set.member taskId pausedSet
+            , taskDetailSnoozeUntil = Map.lookup taskId snoozedMap
+            , taskDetailEventNextCursor = fmap fromSqlKey nextCursor
             }
       returnJson detail
+
+eventPageSize :: Int
+eventPageSize = 200
+
+fetchEventPage
+  :: MonadIO m
+  => TaskId
+  -> Maybe (Key StatusEvent)
+  -> SqlPersistT m ([Entity StatusEvent], Maybe (Key StatusEvent))
+fetchEventPage taskId beforeCursor = do
+  let baseFilters = [StatusEventTaskId ==. taskId]
+      cursorFilters = maybe [] (\cursor -> [StatusEventId <. cursor]) beforeCursor
+      filters = baseFilters <> cursorFilters
+  events <- selectList filters [Desc StatusEventId, LimitTo (eventPageSize + 1)]
+  let (pageItems, rest) = splitAt eventPageSize events
+      nextCursor = case (pageItems, rest) of
+        ([], _) -> Nothing
+        (_, []) -> Nothing
+        (_, _) -> Just (entityKey (last pageItems))
+  pure (pageItems, nextCursor)
+
+readCursorParam :: Maybe Text -> Either Text (Maybe (Key StatusEvent))
+readCursorParam Nothing = Right Nothing
+readCursorParam (Just txt) =
+  case readMaybe (T.unpack txt) of
+    Nothing -> Left "Invalid cursor"
+    Just ident -> Right (Just (toSqlKey ident))
+
+getTaskHistoryR :: TaskId -> Handler Value
+getTaskHistoryR taskId = do
+  beforeParam <- lookupGetParam "beforeId"
+  case readCursorParam beforeParam of
+    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Right cursor -> do
+      (eventPage, nextCursor) <- runDB $ fetchEventPage taskId cursor
+      let page = TaskHistoryPage
+            { taskHistoryEvents = fmap statusEventToDTO eventPage
+            , taskHistoryNextCursor = fmap fromSqlKey nextCursor
+            }
+      returnJson page
 
 patchTaskR :: TaskId -> Handler Value
 patchTaskR taskId = do
@@ -117,18 +199,147 @@ patchTaskR taskId = do
   liftIO $ logEvent app taskId StepFinalize ("Status updated by human: " <> showText newStatus) Nothing
   getTaskR taskId
 
+putTaskTestCommandR :: TaskId -> Handler Value
+putTaskTestCommandR taskId = do
+  app@App {..} <- getYesod
+  TaskTestCommandUpdateRequest {..} <- requireCheckJsonBody
+  settings <- liftIO $ readTVarIO appSettingsVar
+  now <- liftIO getCurrentTime
+  let normalized = fmap T.strip taskTestCommand
+      effective = fromMaybe (settingsTestCommand settings) normalized
+      payload = Just $ object
+        [ "override" .= normalized
+        , "effective" .= effective
+        ]
+      message = case normalized of
+        Nothing -> "Test command override cleared. Using global default."
+        Just cmd -> "Test command override updated to " <> cmd
+  runDB $ update taskId
+    [ TaskTestCommandOverride =. normalized
+    , TaskUpdatedAt =. now
+    ]
+  liftIO $ logEvent app taskId StepImplementation message payload
+  getTaskR taskId
+
 postTaskCancelR :: TaskId -> Handler Value
 postTaskCancelR taskId = do
   app <- getYesod
   liftIO $ cancelTask app taskId
   getTaskR taskId
 
+postTaskQaSkipR :: TaskId -> Handler Value
+postTaskQaSkipR taskId = do
+  app@App { appConnPool } <- getYesod
+  now <- liftIO getCurrentTime
+  liftIO $ runSqlPool
+    (update taskId
+      [ TaskStatus =. TaskStatusReviewing
+      , TaskUpdatedAt =. now
+      ])
+    appConnPool
+  liftIO $ logEvent app taskId StepQaReview "QA step skipped by human" Nothing
+  liftIO $ enqueueTaskStep app taskId StepCommit
+  getTaskR taskId
+
+postTaskPreviewStartR :: TaskId -> Handler Value
+postTaskPreviewStartR taskId = do
+  app@App { appConnPool } <- getYesod
+  outcome <- liftIO $ startPreview app taskId
+  case outcome of
+    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Right url -> do
+      liftIO $ logEvent app taskId StepPreview "Preview launch requested manually" (Just $ object ["url" .= url])
+      liftIO $ enqueueTaskStep app taskId StepFinalize
+      getTaskR taskId
+
 postTaskMessageR :: TaskId -> Handler Value
 postTaskMessageR taskId = do
   app <- getYesod
   AgentMessageRequest {..} <- requireCheckJsonBody
-  liftIO $ logEvent app taskId StepFixIteration ("Human message: " <> agentMessage) Nothing
-  returnJson (object ["ok" .= True])
+  let trimmed = T.strip agentMessage
+      requestedStep = agentMessageNextStep
+      requestedRole = agentMessageRole
+      autoResume = fromMaybe True agentMessageAutoResume
+      logStep = hintStepFor (fromMaybe StepFixIteration (requestedStep <|> defaultStepForRole requestedRole))
+      payload = Just $ object
+        [ "message" .= trimmed
+        , "role" .= requestedRole
+        , "requestedStep" .= requestedStep
+        , "autoResume" .= autoResume
+        , "origin" .= ("human" :: Text)
+        ]
+  liftIO $ logEvent app taskId logStep "Human guidance received" payload
+  resumed <- liftIO $ resumeTaskAfterMessage app taskId trimmed requestedRole requestedStep autoResume "human"
+  returnJson (object ["ok" .= True, "resumed" .= resumed])
+
+postTaskRetryR :: TaskId -> Handler Value
+postTaskRetryR taskId = do
+  app <- getYesod
+  DTO.TaskRetryRequest { DTO.taskRetryInstructions } <- requireCheckJsonBody
+  outcome <- liftIO $ forceRetry app taskId taskRetryInstructions
+  case outcome of
+    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Right step -> returnJson (object ["requeuedStep" .= step])
+
+postTaskPauseR :: TaskId -> Handler Value
+postTaskPauseR taskId = do
+  app <- getYesod
+  runtime <- liftIO $ pauseTask app taskId
+  let payload = case runtime of
+        Nothing -> Nothing
+        Just AgentRuntime { agentRole, agentStep } ->
+          Just $ object
+            [ "interruptedRole" .= agentRole
+            , "interruptedStep" .= agentStep
+            ]
+  liftIO $ logEvent app taskId StepFixIteration "Task paused by human" (withOrigin "human" payload)
+  returnJson (object ["paused" .= True])
+
+postTaskResumeR :: TaskId -> Handler Value
+postTaskResumeR taskId = do
+  app <- getYesod
+  liftIO $ resumeTask app taskId
+  liftIO $ logEvent app taskId StepFixIteration "Task resume requested by human" Nothing
+  returnJson (object ["paused" .= False])
+
+postTaskReassignR :: TaskId -> Handler Value
+postTaskReassignR taskId = do
+  app <- getYesod
+  outcome <- liftIO $ reassignTask app taskId
+  case outcome of
+    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Right step -> returnJson (object ["requeuedStep" .= step])
+
+postTaskRedirectR :: TaskId -> Handler Value
+postTaskRedirectR taskId = do
+  app <- getYesod
+  DTO.TaskRedirectRequest { DTO.taskRedirectTargetTaskId } <- requireCheckJsonBody
+  let targetKey = toSqlKey (fromIntegral taskRedirectTargetTaskId)
+  outcome <- liftIO $ redirectWorker app taskId targetKey
+  case outcome of
+    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Right response -> returnJson response
+
+postTaskSnoozeR :: TaskId -> Handler Value
+postTaskSnoozeR taskId = do
+  app <- getYesod
+  DTO.TaskSnoozeRequest { DTO.taskSnoozeMinutes } <- requireCheckJsonBody
+  let minutes = max 1 taskSnoozeMinutes
+  resumeAt <- liftIO $ scheduleTaskSnooze app taskId minutes
+  returnJson DTO.TaskSnoozeStatus
+    { DTO.taskSnoozeUntil = Just resumeAt
+    }
+
+deleteTaskSnoozeR :: TaskId -> Handler Value
+deleteTaskSnoozeR taskId = do
+  app <- getYesod
+  mExisting <- liftIO $ lookupTaskSnooze app taskId
+  liftIO $ cancelTaskSnooze app taskId
+  when (isJust mExisting) $
+    liftIO $ logEvent app taskId StepFixIteration "Snooze cancelled by human" (Just $ object ["origin" .= ("human" :: Text)])
+  returnJson DTO.TaskSnoozeStatus
+    { DTO.taskSnoozeUntil = Nothing
+    }
 
 getTaskStatusStreamR :: TaskId -> Handler TypedContent
 getTaskStatusStreamR taskId = do
@@ -221,24 +432,11 @@ postPreviewPingR taskId = do
 
 -- Conversions --------------------------------------------------------------
 
-taskSummaryFromEntity :: Entity Task -> TaskSummary
-taskSummaryFromEntity (Entity key task) =
-  TaskSummary
-    { taskSummaryId = fromIntegral (fromSqlKey key)
-    , taskSummaryTitle = taskTitle task
-    , taskSummaryStatus = taskStatus task
-    , taskSummaryRepoRoot = taskRepoRoot task
-    , taskSummaryBranch = taskBranch task
-    , taskSummaryFeatureBranch = taskFeatureBranch task
-    , taskSummaryUpdatedAt = taskUpdatedAt task
-    , taskSummaryPreviewUrl = taskPreviewUrl task
-    , taskSummaryPreviewStatus = taskPreviewStatus task
-    }
-
 statusEventToDTO :: Entity StatusEvent -> StatusEventDTO
-statusEventToDTO (Entity _ StatusEvent { statusEventStep = step, statusEventMessage = message, statusEventCreatedAt = created, statusEventPayload = payload }) =
+statusEventToDTO (Entity key StatusEvent { statusEventStep = step, statusEventMessage = message, statusEventCreatedAt = created, statusEventPayload = payload }) =
   StatusEventDTO
-    { statusEventStep = step
+    { statusEventId = Just (fromSqlKey key)
+    , statusEventStep = step
     , statusEventMessage = message
     , statusEventCreatedAt = created
     , statusEventPayload = payload
