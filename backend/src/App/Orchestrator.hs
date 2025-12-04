@@ -22,11 +22,25 @@ module App.Orchestrator
   , lookupTaskSnooze
   , taskSummaryFromEntity
   , withOrigin
+  , runSpecVerification
   ) where
 
 import App.AgentGateway
+import App.Evidence
+  ( EvidenceCapture(..)
+  , EvidenceOptions(..)
+  , collectDemoEvidence
+  , defaultEvidenceOptions
+  )
+import App.RepoProfiles
+  ( RepoProfile(..)
+  , RepoProfiles(..)
+  , lookupRepoProfile
+  , runRepoProfileSetup
+  )
+import App.Gemini (GeminiVerdict(..), runGeminiReview)
 import App.Foundation (AgentRuntime(..), App(..), WorkerMetrics(..), WorkerRuntimeState(..))
-import App.Logging (logError, logInfo)
+import App.Logging (logError, logInfo, logWarn)
 import App.Models
 import qualified App.Models as Models
 import App.Preview
@@ -63,19 +77,34 @@ import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO, wr
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, forever, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value(..), object, (.=), toJSON)
+import Data.Aeson
+  ( FromJSON(..)
+  , Value(..)
+  , eitherDecode
+  , object
+  , withObject
+  , (.:)
+  , (.:?)
+  , (.=)
+  , toJSON
+  )
+import Data.Aeson.Types (parseEither)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KeyMap
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isNothing)
+import Text.Read (readMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.ByteString.Lazy as BL
 import Control.Exception (SomeException, displayException, throwIO, try)
-import System.Directory (canonicalizePath)
+import System.Directory (canonicalizePath, doesDirectoryExist, doesFileExist)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
+import System.FilePath ((</>))
 import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, terminateProcess)
 
 startOrchestrator :: App -> IO ()
@@ -87,11 +116,31 @@ startOrchestrator app@App { appWorkerStates, appWorkerMetrics, appWorkerCount } 
         initialMetrics = Map.fromList (map (\workerId -> (workerId, defaultWorkerMetrics)) workerIds)
     writeTVar appWorkerStates initialStates
     writeTVar appWorkerMetrics initialMetrics
+  pauseActiveTasksOnStartup app
   forM_ workerIds $ \workerId -> void (async (workerLoop app workerId))
   _ <- async (inactivityMonitor app)
   _ <- async (snoozeMonitor app)
+  _ <- async (repoSyncMonitor app)
+  _ <- async (previewMonitor app)
   logInfo $ "Orchestrator workers started (count=" <> showText appWorkerCount <> ")"
   pure ()
+
+pauseActiveTasksOnStartup :: App -> IO ()
+pauseActiveTasksOnStartup app@App { appConnPool, appPausedTasks } = do
+  active <-
+    runSqlPool
+      (selectList
+        [ TaskStatus !=. TaskStatusCompleted
+        , TaskStatus !=. TaskStatusCancelled
+        , TaskStatus !=. TaskStatusDiscarded
+        ]
+        [])
+      appConnPool
+  let activeIds = Set.fromList (map entityKey active)
+  atomically $ writeTVar appPausedTasks activeIds
+  for_ active $ \(Entity taskId _) ->
+    logEvent app taskId StepFixIteration "Task paused on startup; resume manually"
+      (withOrigin "system" Nothing)
 
 data AssignmentResult
   = AssignmentClaimed
@@ -128,6 +177,211 @@ workerLoop app@App { appQueue } workerId = forever $ do
           case result of
             Left err -> throwIO err
             Right _ -> releaseIfFinished app workerId taskId
+
+repoSyncMonitor :: App -> IO ()
+repoSyncMonitor app = do
+  intervalMicros <- determineInterval
+  forever $ do
+    syncResult <- try @SomeException (syncActiveBranches app)
+    case syncResult of
+      Left err ->
+        logError $ "Repo sync tick failed: " <> T.pack (displayException err)
+      Right () ->
+        pure ()
+    threadDelay intervalMicros
+  where
+    determineInterval = do
+      env <- lookupEnv "REPO_SYNC_INTERVAL_SECONDS"
+      let parsed = env >>= readMaybe
+          seconds = clampInterval (fromMaybe 60 parsed)
+      pure (seconds * 1000000)
+    clampInterval s = max 10 (min 900 s)
+
+previewMonitor :: App -> IO ()
+previewMonitor app@App { appConnPool, appManager } =
+  forever $ do
+    processes <- runSqlPool (selectList [PreviewProcessStatus !=. PreviewFailed] []) appConnPool
+    for_ processes $ \(Entity _ proc) -> do
+      let taskId = previewProcessTaskId proc
+          mPid = previewProcessPid proc
+      alive <- maybe (pure True) isPreviewProcessAlive mPid
+      unless alive $ do
+        markPreviewFailed appConnPool taskId "Preview process exited unexpectedly" mPid
+        logEvent app taskId StepPreview "Preview process exited unexpectedly"
+          (Just $ object ["pid" .= mPid])
+      when alive $ do
+        mTask <- runSqlPool (get taskId) appConnPool
+        for_ mTask $ \task -> do
+          let url = fromMaybe (previewUrlForTask taskId) (taskPreviewUrl task)
+          status <- pingPreview appManager url
+          case status of
+            PreviewOnline ->
+              when (previewProcessStatus proc /= PreviewOnline || taskPreviewStatus task /= PreviewOnline) $ do
+                markPreviewOnline appConnPool taskId
+                logEvent app taskId StepPreview "Preview marked online"
+                  (Just $ object ["url" .= url])
+            PreviewFailed -> do
+              markPreviewFailed appConnPool taskId "Preview health check failed" mPid
+              logEvent app taskId StepPreview "Preview health check failed"
+                (Just $ object ["url" .= url])
+            _ -> pure ()
+    threadDelay (20 * 1000000)
+
+syncActiveBranches :: App -> IO ()
+syncActiveBranches app@App { appConnPool, appSettingsVar, appAgentRegistry, appPausedTasks } = do
+  settings <- readTVarIO appSettingsVar
+  activeTasks <-
+    runSqlPool
+      (selectList
+        [ TaskStatus !=. TaskStatusCompleted
+        , TaskStatus !=. TaskStatusCancelled
+        , TaskStatus !=. TaskStatusDiscarded
+        ]
+        [])
+      appConnPool
+  activeAgents <- readTVarIO appAgentRegistry
+  paused <- readTVarIO appPausedTasks
+  let defaultRepo = T.unpack (settingsDefaultRepoRoot settings)
+      grouped =
+        foldr
+          (\entity@(Entity _ task) acc ->
+            let repoRoot = T.unpack (taskRepoRoot task)
+             in Map.insertWith (<>) repoRoot [entity] acc
+          )
+          Map.empty
+          activeTasks
+      withDefault =
+        if Map.member defaultRepo grouped || null defaultRepo
+          then grouped
+          else Map.insert defaultRepo [] grouped
+  for_ (Map.toList withDefault) $ \(repoRoot, tasks) ->
+    syncRepoRoot app settings repoRoot tasks activeAgents paused
+
+syncRepoRoot
+  :: App
+  -> AppSettingsDTO
+  -> FilePath
+  -> [Entity Task]
+  -> Map.Map TaskId AgentRuntime
+  -> Set.Set TaskId
+  -> IO ()
+syncRepoRoot app settings repoRoot taskEntities activeAgents pausedSet = do
+  exists <- doesDirectoryExist repoRoot
+  unless exists $
+    logWarn $ "Repo sync skipped missing repo root " <> T.pack repoRoot
+  when exists $ do
+    _ <- runRawGit repoRoot ["fetch", "--prune", "origin"]
+    for_ taskEntities $ \entity ->
+      syncTaskBranch app settings repoRoot entity activeAgents pausedSet
+
+syncTaskBranch
+  :: App
+  -> AppSettingsDTO
+  -> FilePath
+  -> Entity Task
+  -> Map.Map TaskId AgentRuntime
+  -> Set.Set TaskId
+  -> IO ()
+syncTaskBranch app@App { appConnPool } settings repoRoot (Entity taskId task) activeAgents pausedSet =
+  case (taskFeatureBranch task, T.strip (taskBranch task)) of
+    (Just featureBranch, baseBranch)
+      | T.null baseBranch -> pure ()
+      | T.null (T.strip featureBranch) -> pure ()
+      | Map.member taskId activeAgents -> pure ()
+      | Set.member taskId pausedSet -> pure ()
+      | otherwise -> do
+          prepareResult <- try @SomeException (prepareWorktree app repoRoot baseBranch taskId False)
+          case prepareResult of
+            Left err ->
+              logWarn $
+                "Repo sync failed to prepare worktree for task "
+                  <> taskKeyText taskId
+                  <> ": "
+                  <> T.pack (displayException err)
+            Right worktree -> do
+              clean <- isWorktreeClean worktree
+              unless clean $
+                logInfo $
+                  "Repo sync skipped dirty worktree for task "
+                    <> taskKeyText taskId
+              when clean $ do
+                behind <- branchNeedsRebase worktree baseBranch
+                when behind $ do
+                  logEvent app taskId StepImplementation "Auto-sync merging latest base branch" (withOrigin "system" (Just $ object ["base" .= baseBranch]))
+                  mergeOutcome <- mergeBaseIntoWorktree worktree baseBranch
+                  case mergeOutcome of
+                    Left errMsg -> do
+                      logEvent app taskId StepImplementation "Auto-sync merge failed" (withOrigin "system" (Just $ object ["error" .= errMsg]))
+                      scheduleFixIteration app taskId StepImplementation "Auto-sync merge failed; manual intervention required" (Just $ object ["error" .= errMsg])
+                    Right () -> do
+                      let defaultCommand = settingsTestCommand settings
+                          testCommand = fromMaybe defaultCommand (taskTestCommandOverride task)
+                      logEvent app taskId StepImplementation "Auto-sync running regression tests" (withOrigin "system" (Just $ object ["command" .= testCommand]))
+                      tests <- runTestsInWorktree app taskId StepImplementation AgentRoleImplementer worktree testCommand
+                      storeTestArtifact appConnPool taskId testCommand tests
+                      case wrExitCode tests of
+                        ExitSuccess -> do
+                          pushResult <- pushFeatureBranch worktree featureBranch
+                          case pushResult of
+                            Left errMsg ->
+                              logWarn $
+                                "Auto-sync push failed for task "
+                                  <> taskKeyText taskId
+                                  <> ": "
+                                  <> errMsg
+                            Right () ->
+                              logEvent app taskId StepImplementation "Auto-sync merged base branch and pushed feature branch" (withOrigin "system" (Just $ object ["branch" .= featureBranch, "base" .= baseBranch]))
+                        failureCode -> do
+                          let payload =
+                                Just $
+                                  object
+                                    [ "exitCode" .= show failureCode
+                                    , "command" .= testCommand
+                                    , "branch" .= featureBranch
+                                    , "base" .= baseBranch
+                                    ]
+                          logEvent app taskId StepImplementation "Auto-sync tests failed after merging base branch" (withOrigin "system" payload)
+                          scheduleFixIteration app taskId StepImplementation "Auto-sync detected failing tests after updating from base branch" payload
+    _ -> pure ()
+
+isWorktreeClean :: WorktreeContext -> IO Bool
+isWorktreeClean WorktreeContext { wtRoot } = do
+  (code, stdoutText, _) <- runRawGit wtRoot ["status", "--porcelain"]
+  let cleaned = T.strip (T.pack stdoutText)
+  pure (code == ExitSuccess && T.null cleaned)
+
+branchNeedsRebase :: WorktreeContext -> Text -> IO Bool
+branchNeedsRebase WorktreeContext { wtRoot } baseBranch = do
+  let ref = "origin/" <> T.unpack baseBranch
+  (code, stdoutText, _) <- runRawGit wtRoot ["rev-list", "--count", "HEAD.." <> ref]
+  case code of
+    ExitSuccess ->
+      case (readMaybe (T.unpack (T.strip (T.pack stdoutText))) :: Maybe Int) of
+        Just count -> pure (count > 0)
+        Nothing -> pure False
+    _ -> pure False
+
+mergeBaseIntoWorktree :: WorktreeContext -> Text -> IO (Either Text ())
+mergeBaseIntoWorktree WorktreeContext { wtRoot } baseBranch = do
+  let ref = "origin/" <> T.unpack baseBranch
+  result <- runRawGit wtRoot ["merge", "--no-edit", ref]
+  case result of
+    (ExitSuccess, _, _) -> pure (Right ())
+    (_, _, stderrText) -> do
+      _ <- runRawGit wtRoot ["merge", "--abort"]
+      pure . Left $ T.strip (T.pack stderrText)
+
+pushFeatureBranch :: WorktreeContext -> Text -> IO (Either Text ())
+pushFeatureBranch WorktreeContext { wtRoot } featureBranch = do
+  let branchName = T.unpack featureBranch
+  result <- runRawGit wtRoot ["push", "origin", branchName]
+  case result of
+    (ExitSuccess, _, _) -> pure (Right ())
+    (_, _, stderrText) -> pure . Left $ T.strip (T.pack stderrText)
+
+runRawGit :: FilePath -> [String] -> IO (ExitCode, String, String)
+runRawGit dir args =
+  readCreateProcessWithExitCode (proc "git" ("-C" : dir : args)) ""
 
 messageTaskId :: QueueMessage -> TaskId
 messageTaskId (QueueKickoff taskId) = taskId
@@ -472,9 +726,22 @@ runImplementation app@App { appConnPool, appSettingsVar } taskId = do
             resetRetryState app taskId
             updateRunAndStatus app taskId StepImplementation TaskStatusImplementing (arSummary result)
             logEvent app taskId StepImplementation "Implementation agent run completed" (Just $ object ["summary" .= arSummary result])
-            diffText <- collectDiff worktree
-            storeDiffArtifact appConnPool taskId diffText
-            enqueueStep app taskId StepSpecVerification
+            logEvent app taskId StepImplementation "Running configured test command after implementation" (Just $ object ["command" .= testCommand])
+            tests <- runTestsInWorktree app taskId StepImplementation AgentRoleImplementer worktree testCommand
+            storeTestArtifact appConnPool taskId testCommand tests
+            case wrExitCode tests of
+              ExitSuccess -> do
+                logEvent app taskId StepImplementation "Post-implementation tests passed" Nothing
+                diffText <- collectDiff worktree
+                storeDiffArtifact appConnPool taskId diffText
+                enqueueStep app taskId StepSpecVerification
+              code -> do
+                let payload = object
+                      [ "exitCode" .= show code
+                      , "command" .= testCommand
+                      ]
+                    summary = "Test command failed after implementation; see worktree-tests artifact"
+                scheduleFixIteration app taskId StepImplementation summary (Just payload)
           else markBlocked app taskId StepImplementation (arSummary result) Nothing
 
 runSpecVerification :: App -> TaskId -> IO ()
@@ -485,20 +752,224 @@ runSpecVerification app@App { appConnPool } taskId = do
     Just task -> do
       let repoRoot = T.unpack (taskRepoRoot task)
       worktree <- locateWorktree repoRoot taskId
-      result <- runAgentSession app taskId StepSpecVerification AgentRoleProjectManager "pm_verification" (Just worktree) Nothing
-      halted <- shouldAbortTask app taskId
-      if halted
-        then logInfo $ "Spec verification post-processing skipped for halted task " <> taskKeyText taskId
-        else if agentSucceeded result
-          then do
-            updateRunAndStatus app taskId StepSpecVerification TaskStatusImplementing (arSummary result)
-            logEvent app taskId StepSpecVerification "Project manager verified implementation against spec" (Just $ object ["summary" .= arSummary result])
-            enqueueStep app taskId StepPmReview
-          else
-            scheduleFixIteration app taskId StepSpecVerification (arSummary result) Nothing
+      criteria <- runSqlPool (selectList [TaskAcceptanceCriterionTaskId ==. taskId] [Asc TaskAcceptanceCriterionOrdinal]) appConnPool
+      evidenceResult <- collectRepoEvidence app taskId repoRoot worktree
+      proceed <- processEvidence criteria evidenceResult
+      when proceed $ do
+        result <- runAgentSession app taskId StepSpecVerification AgentRoleVerifier "verifier" (Just worktree) Nothing
+        halted <- shouldAbortTask app taskId
+        if halted
+          then logInfo $ "Spec verification post-processing skipped for halted task " <> taskKeyText taskId
+          else if agentSucceeded result
+            then do
+              updateRunAndStatus app taskId StepSpecVerification TaskStatusImplementing (arSummary result)
+              logEvent app taskId StepSpecVerification "Verifier agent approved implementation" (Just $ object ["summary" .= arSummary result])
+              enqueueStep app taskId StepPmReview
+            else
+              scheduleFixIteration app taskId StepSpecVerification (arSummary result) Nothing
+  where
+    processEvidence :: [Entity TaskAcceptanceCriterion] -> Either Text EvidenceCapture -> IO Bool
+    processEvidence _ (Left err) = do
+      logEvent app taskId StepSpecVerification "Automated verifier evidence failed" (Just $ object ["error" .= err])
+      scheduleFixIteration app taskId StepSpecVerification "Unable to capture verifier evidence" (Just $ object ["error" .= err])
+      pure False
+    processEvidence criteria (Right capture) = do
+      runSqlPool
+        (do
+          for_ (ecScreenshotPath capture) $ \path ->
+            storeArtifactWithPath taskId
+              ( ArtifactScreenshot
+              , "verifier-screenshot"
+              , Nothing
+              , Just (T.pack path)
+              )
+          storeArtifact taskId
+            ( ArtifactVerificationEvidence
+            , "verifier-evidence"
+            , Just (ecSummary capture)
+            )
+        )
+        appConnPool
+      logEvent app taskId StepSpecVerification "Automated verifier evidence captured"
+        (Just $ object
+          [ "source" .= ecSource capture
+          , "metrics" .= ecSummary capture
+          ])
+      case ecScreenshotPath capture of
+        Nothing -> do
+          scheduleFixIteration app taskId StepSpecVerification "Screenshot missing from verifier evidence" Nothing
+          pure False
+        Just shotPath -> do
+          automationOutcome <- loadAutomationVerdict (ecSandboxDir capture)
+          let storeReport label payload =
+                runSqlPool
+                  (storeArtifact taskId
+                    ( ArtifactVerifierReport
+                    , label
+                    , Just payload
+                    )
+                  )
+                  appConnPool
+              automationReportPayload report =
+                object
+                  [ "source" .= ("automation" :: Text)
+                  , "report" .= avrPayload report
+                  ]
+              automationFixPayload report =
+                object
+                  [ "source" .= ("automation" :: Text)
+                  , "issues" .= avrIssues report
+                  , "summary" .= avrSummary report
+                  ]
+              geminiReportPayload verdict =
+                object
+                  [ "source" .= ("gemini" :: Text)
+                  , "report" .= object
+                      [ "passed" .= gvPassed verdict
+                      , "summary" .= gvSummary verdict
+                      , "violations" .= gvViolations verdict
+                      ]
+                  ]
+              runGeminiFlow = do
+                geminiOutcome <- runGeminiReview (Just shotPath) (ecSummary capture) criteria
+                case geminiOutcome of
+                  Left geminiErr -> do
+                    let payload = object
+                          [ "source" .= ("gemini" :: Text)
+                          , "error" .= geminiErr
+                          ]
+                    logEvent app taskId StepSpecVerification "Gemini verifier error" (Just payload)
+                    scheduleFixIteration app taskId StepSpecVerification "Gemini verifier failed" (Just payload)
+                    pure False
+                  Right verdict -> do
+                    storeReport "gemini-verdict" (geminiReportPayload verdict)
+                    if gvPassed verdict
+                      then pure True
+                      else do
+                        let payload = object
+                              [ "source" .= ("gemini" :: Text)
+                              , "summary" .= gvSummary verdict
+                              , "violations" .= gvViolations verdict
+                              ]
+                        logEvent app taskId StepSpecVerification "Gemini verifier rejected implementation" (Just payload)
+                        scheduleFixIteration app taskId StepSpecVerification (gvSummary verdict)
+                          (Just $ object
+                            [ "source" .= ("gemini" :: Text)
+                            , "violations" .= gvViolations verdict
+                            ])
+                        pure False
+          case automationOutcome of
+            Left reportErr -> do
+              let payload = object
+                    [ "source" .= ("automation" :: Text)
+                    , "error" .= reportErr
+                    ]
+              logEvent app taskId StepSpecVerification "Automation verifier report invalid" (Just payload)
+              runGeminiFlow
+            Right Nothing ->
+              runGeminiFlow
+            Right (Just report) -> do
+              storeReport "automation-verdict" (automationReportPayload report)
+              when (avrPassed report) $
+                logEvent app taskId StepSpecVerification "Automation verifier approved implementation"
+                  (Just $ object
+                    [ "summary" .= avrSummary report
+                    , "issues" .= avrIssues report
+                    , "source" .= ("automation" :: Text)
+                    ])
+              when (not (avrPassed report)) $
+                logEvent app taskId StepSpecVerification "Automation verifier rejected implementation"
+                  (Just $ object
+                    [ "summary" .= avrSummary report
+                    , "issues" .= avrIssues report
+                    , "source" .= ("automation" :: Text)
+                    ])
+              runGeminiFlow
+
+collectRepoEvidence :: App -> TaskId -> FilePath -> WorktreeContext -> IO (Either Text EvidenceCapture)
+collectRepoEvidence app@App { appRepoProfiles } taskId repoRoot worktree = do
+  mProfile <- lookupRepoProfile appRepoProfiles repoRoot
+  case mProfile of
+    Nothing -> collectDemoEvidence defaultEvidenceOptions worktree
+    Just profile@RepoProfile { rpName } -> do
+      logEvent app taskId StepSpecVerification "Applying repo profile before verification"
+        (withOrigin "system" (Just $ object ["profile" .= rpName]))
+      setupResult <- runRepoProfileSetup profile
+      case setupResult of
+        Left err -> do
+          logEvent app taskId StepSpecVerification "Repo profile setup failed; falling back to demo evidence"
+            (Just $ object ["profile" .= rpName, "error" .= err])
+          collectDemoEvidence (evidenceOptionsFromProfile profile) worktree
+        Right () ->
+          collectDemoEvidence (evidenceOptionsFromProfile profile) worktree
+
+evidenceOptionsFromProfile :: RepoProfile -> EvidenceOptions
+evidenceOptionsFromProfile RepoProfile { rpSandboxOverride, rpCaptureCommand, rpEnv } =
+  defaultEvidenceOptions
+    { eoSandboxOverride = rpSandboxOverride
+    , eoCaptureCommand = rpCaptureCommand
+    , eoEnv = ensureDefault "VERIFIER_DISABLE_PLAYWRIGHT" "0" (Map.toList rpEnv)
+    }
+  where
+    ensureDefault key value env =
+      if any ((== key) . fst) env
+        then env
+        else (key, value) : env
+
+data AutomationReport = AutomationReport
+  { avrPayload :: Value
+  , avrPassed :: Bool
+  , avrSummary :: Text
+  , avrIssues :: [Text]
+  }
+
+data AutomationVerdict = AutomationVerdict
+  { avPassed :: Bool
+  , avSummary :: Text
+  , avIssues :: [Text]
+  }
+
+instance FromJSON AutomationVerdict where
+  parseJSON = withObject "AutomationVerdict" $ \obj -> do
+    passed <- obj .: "passed"
+    summary <- obj .: "summary"
+    issues <- fromMaybe [] <$> obj .:? "issues"
+    pure AutomationVerdict
+      { avPassed = passed
+      , avSummary = summary
+      , avIssues = issues
+      }
+
+loadAutomationVerdict :: FilePath -> IO (Either Text (Maybe AutomationReport))
+loadAutomationVerdict sandboxDir = do
+  let reportPath = sandboxDir </> "automation-report.json"
+  reportExists <- doesFileExist reportPath
+  if not reportExists
+    then pure (Right Nothing)
+    else do
+      bytesResult <- try @SomeException (BL.readFile reportPath)
+      case bytesResult of
+        Left err ->
+          pure . Left $ "Unable to read automation report: " <> T.pack (displayException err)
+        Right bytes ->
+          case eitherDecode bytes :: Either String Value of
+            Left err ->
+              pure . Left $ "Invalid automation report JSON: " <> T.pack err
+            Right value ->
+              case parseEither parseJSON value of
+                Left err ->
+                  pure . Left $ "Automation report missing required fields: " <> T.pack err
+                Right verdict ->
+                  pure . Right . Just $
+                    AutomationReport
+                      { avrPayload = value
+                      , avrPassed = avPassed verdict
+                      , avrSummary = avSummary verdict
+                      , avrIssues = avIssues verdict
+                      }
 
 runPmReview :: App -> TaskId -> IO ()
-runPmReview app@App { appConnPool, appSettingsVar } taskId = do
+runPmReview app taskId = do
   result <- runAgentSession app taskId StepPmReview AgentRoleProjectManager "pm_design" Nothing Nothing
   halted <- shouldAbortTask app taskId
   if halted
@@ -507,28 +978,7 @@ runPmReview app@App { appConnPool, appSettingsVar } taskId = do
       then do
         updateRunAndStatus app taskId StepPmReview TaskStatusReviewing (arSummary result)
         logEvent app taskId StepPmReview "Project manager review complete" (Just $ object ["summary" .= arSummary result])
-        mTask <- runSqlPool (get taskId) appConnPool
-        case mTask of
-          Nothing -> logError $ "Task disappeared before post-review tests " <> taskKeyText taskId
-          Just task -> do
-            settings <- readTVarIO appSettingsVar
-            let defaultCommand = settingsTestCommand settings
-                testCommand = fromMaybe defaultCommand (taskTestCommandOverride task)
-            worktree <- locateWorktree (T.unpack (taskRepoRoot task)) taskId
-            logEvent app taskId StepPmReview "Running configured test command" (Just $ object ["command" .= testCommand])
-            tests <- runTestsInWorktree app taskId StepPmReview AgentRoleProjectManager worktree testCommand
-            storeTestArtifact appConnPool taskId testCommand tests
-            case wrExitCode tests of
-              ExitSuccess -> do
-                logEvent app taskId StepPmReview "Post-review tests passed" Nothing
-                enqueueStep app taskId StepCommit
-              code -> do
-                let payload = object
-                      [ "exitCode" .= show code
-                      , "command" .= testCommand
-                      ]
-                    summary = "Test command failed after PM review; see worktree-tests artifact"
-                scheduleFixIteration app taskId StepPmReview summary (Just payload)
+        enqueueStep app taskId StepCommit
       else
         scheduleFixIteration app taskId StepPmReview (arSummary result) Nothing
 
@@ -770,14 +1220,18 @@ runAgentWithRetries app taskId step _ AgentGateway { runAgent } invocation = go 
     shouldRetry _ = False
 
 storeArtifact :: TaskId -> (ArtifactKind, Text, Maybe Value) -> SqlPersistT IO ()
-storeArtifact taskId (kind, label, payload) = do
+storeArtifact taskId (kind, label, payload) =
+  storeArtifactWithPath taskId (kind, label, payload, Nothing)
+
+storeArtifactWithPath :: TaskId -> (ArtifactKind, Text, Maybe Value, Maybe Text) -> SqlPersistT IO ()
+storeArtifactWithPath taskId (kind, label, payload, mPath) = do
   now <- liftIO getCurrentTime
   insert_ Artifact
     { artifactTaskId = taskId
     , artifactKind = kind
     , artifactLabel = label
     , artifactContent = payload
-    , artifactPath = Nothing
+    , artifactPath = mPath
     , artifactCreatedAt = now
     }
 
@@ -1134,6 +1588,8 @@ buildFixIterationHint step summary payload =
   case step of
     StepPmReview ->
       summary <> maybe "" formatTestPayload payload
+    StepImplementation ->
+      summary <> maybe "" formatTestPayload payload
     StepSpecVerification -> summary
     _ -> summary
   where
@@ -1253,6 +1709,7 @@ defaultStepForRole :: Maybe AgentRole -> Maybe WorkflowStep
 defaultStepForRole (Just AgentRoleProjectManager) = Just StepPmReview
 defaultStepForRole (Just AgentRoleImplementer) = Just StepImplementation
 defaultStepForRole (Just AgentRoleQa) = Just StepQaReview
+defaultStepForRole (Just AgentRoleVerifier) = Just StepSpecVerification
 defaultStepForRole _ = Nothing
 
 hintStepFor :: WorkflowStep -> WorkflowStep
@@ -1475,6 +1932,7 @@ buildAgentContext taskId step mWorktree mInstructions = do
   events <- selectList [StatusEventTaskId ==. taskId] [Desc StatusEventCreatedAt, LimitTo 12]
   artifacts <- selectList [ArtifactTaskId ==. taskId] [Desc ArtifactCreatedAt, LimitTo 8]
   design <- selectFirst [ArtifactTaskId ==. taskId, ArtifactKind ==. ArtifactDesign] [Asc ArtifactCreatedAt]
+  criteria <- selectList [TaskAcceptanceCriterionTaskId ==. taskId] [Asc TaskAcceptanceCriterionOrdinal]
   let taskValue = maybe (object ["missing" .= True]) taskToValue mTask
       worktreeValue = maybe Null worktreeToValue mWorktree
       instructionsValue = maybe Null toJSON mInstructions
@@ -1489,6 +1947,7 @@ buildAgentContext taskId step mWorktree mInstructions = do
     , "progressSummary" .= progressSummary
     , "recentEvents" .= compactEvents
     , "recentArtifacts" .= compactArtifacts
+    , "acceptanceCriteria" .= map criterionToMeta criteria
     , "worktree" .= worktreeValue
     , "additionalInstructions" .= instructionsValue
     ]
@@ -1518,13 +1977,18 @@ statusEventToCompact (Entity _ StatusEvent { statusEventStep, statusEventMessage
     ]
 
 artifactToMeta :: Entity Artifact -> Value
-artifactToMeta (Entity _ Artifact { artifactKind, artifactLabel, artifactPath, artifactCreatedAt }) =
+artifactToMeta (Entity _ Artifact { artifactKind, artifactLabel, artifactPath, artifactCreatedAt, artifactContent }) =
   object
     [ "kind" .= artifactKind
     , "label" .= artifactLabel
     , "path" .= artifactPath
     , "createdAt" .= artifactCreatedAt
+    , "body" .= artifactBody artifactKind artifactContent
     ]
+  where
+    artifactBody ArtifactTestLog (Just body) = body
+    artifactBody ArtifactTestLog Nothing = Null
+    artifactBody _ _ = Null
 
 designArtifactValue :: Entity Artifact -> Value
 designArtifactValue (Entity _ Artifact { artifactContent, artifactLabel, artifactCreatedAt }) =
@@ -1584,6 +2048,14 @@ worktreeToValue WorktreeContext { wtRoot, wtRepoRoot, wtBranch, wtTaskSlug } =
     , "slug" .= wtTaskSlug
     ]
 
+criterionToMeta :: Entity TaskAcceptanceCriterion -> Value
+criterionToMeta (Entity _ TaskAcceptanceCriterion { taskAcceptanceCriterionBody = body, taskAcceptanceCriterionIsMet = isMet, taskAcceptanceCriterionOrdinal = ord }) =
+  object
+    [ "body" .= body
+    , "isMet" .= isMet
+    , "ordinal" .= ord
+    ]
+
 resolveWorkingDir :: Maybe WorktreeContext -> Maybe Task -> IO (Maybe FilePath)
 resolveWorkingDir (Just wt) _ = pure (Just (wtRoot wt))
 resolveWorkingDir Nothing (Just task)
@@ -1601,10 +2073,6 @@ instructionsFor AgentRoleProjectManager StepPmReview _ = Just $ T.unlines
   [ "Review the implemented work."
   , "Summarise the diff, note outstanding risks, and confirm readiness for QA."
   ]
-instructionsFor AgentRoleProjectManager StepSpecVerification _ = Just $ T.unlines
-  [ "Confirm the implementation meets the full specification before tests are executed."
-  , "Inspect the diff, design, and task description for missing requirements or regressions."
-  , "If anything is missing, exit with a failure so the implementation agent will re-run." ]
 instructionsFor AgentRoleImplementer StepImplementation mCmd = Just $ T.unlines
   [ "Work in the provided feature branch and workspace."
   , case mCmd of
@@ -1617,5 +2085,12 @@ instructionsFor AgentRoleImplementer StepImplementation mCmd = Just $ T.unlines
 instructionsFor AgentRoleQa StepQaReview _ = Just $ T.unlines
   [ "Review the diff and tests for bugs or security issues."
   , "Call out regressions, missing tests, or vulnerabilities with guidance for fixes."
+  ]
+instructionsFor AgentRoleVerifier StepSpecVerification _ = Just $ T.unlines
+  [ "You are the autonomous verifier."
+  , "Use the provided evidence bundle (screenshots, diff summaries, and agent artifacts) to confirm work satisfies the specification."
+  , "Walk through every acceptance criterion in the context JSON and state whether it passes, citing the supporting artifact for each."
+  , "Reference artifact labels when citing proof. Fail the step if any acceptance criterion is unmet or evidence is missing."
+  , "Only approve when evidence proves the feature works end-to-end."
   ]
 instructionsFor _ _ _ = Nothing

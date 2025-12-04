@@ -18,12 +18,15 @@ module App.Types
   , TaskRunInfo(..)
   , StatusEventDTO(..)
   , ArtifactDTO(..)
+  , AcceptanceCriterionDTO(..)
   , PromptTemplateDTO(..)
   , PromptRevisionDTO(..)
   , AppSettingsDTO(..)
   , TaskCreateRequest(..)
   , TaskUpdateStatusRequest(..)
   , TaskTestCommandUpdateRequest(..)
+  , TaskCriteriaUpdateRequest(..)
+  , TaskCriterionInput(..)
   , SettingsUpdateRequest(..)
   , PromptUpdateRequest(..)
   , PromptResetRequest(..)
@@ -82,6 +85,7 @@ data AgentRole
   = AgentRoleProjectManager
   | AgentRoleImplementer
   | AgentRoleQa
+  | AgentRoleVerifier
   deriving (Show, Read, Eq, Ord, Enum, Bounded, Generic, ToJSON, FromJSON)
 
 data AgentSessionStatus
@@ -99,6 +103,9 @@ data ArtifactKind
   | ArtifactPreviewLog
   | ArtifactPreviewPing
   | ArtifactAgentTranscript
+  | ArtifactScreenshot
+  | ArtifactVerificationEvidence
+  | ArtifactVerifierReport
   deriving (Show, Read, Eq, Ord, Enum, Bounded, Generic, ToJSON, FromJSON)
 
 data PreviewStatus
@@ -133,11 +140,20 @@ data TaskRunInfo = TaskRunInfo
   deriving (Show, Eq, Generic, ToJSON)
 
 data ArtifactDTO = ArtifactDTO
-  { artifactKind :: ArtifactKind
+  { artifactId :: Int64
+  , artifactKind :: ArtifactKind
   , artifactLabel :: Text
   , artifactBody :: Maybe Value
   , artifactPath :: Maybe Text
   , artifactCreatedAt :: UTCTime
+  }
+  deriving (Show, Eq, Generic, ToJSON)
+
+data AcceptanceCriterionDTO = AcceptanceCriterionDTO
+  { criterionId :: Int64
+  , criterionBody :: Text
+  , criterionIsMet :: Bool
+  , criterionOrdinal :: Int
   }
   deriving (Show, Eq, Generic, ToJSON)
 
@@ -155,6 +171,7 @@ data TaskDetail = TaskDetail
   , taskDetailRuns :: [TaskRunInfo]
   , taskDetailEvents :: [StatusEventDTO]
   , taskDetailArtifacts :: [ArtifactDTO]
+  , taskDetailCriteria :: [AcceptanceCriterionDTO]
   , taskDetailTestCommand :: Text
   , taskDetailTestCommandOverride :: Maybe Text
   , taskDetailIsPaused :: Bool
@@ -213,6 +230,18 @@ data TaskUpdateStatusRequest = TaskUpdateStatusRequest
 
 data TaskTestCommandUpdateRequest = TaskTestCommandUpdateRequest
   { taskTestCommand :: Maybe Text
+  }
+  deriving (Show, Eq, Generic, FromJSON)
+
+data TaskCriteriaUpdateRequest = TaskCriteriaUpdateRequest
+  { taskCriteriaItems :: [TaskCriterionInput]
+  }
+  deriving (Show, Eq, Generic, FromJSON)
+
+data TaskCriterionInput = TaskCriterionInput
+  { criterionId :: Maybe Int64
+  , criterionBody :: Text
+  , criterionIsMet :: Bool
   }
   deriving (Show, Eq, Generic, FromJSON)
 
@@ -334,6 +363,7 @@ deriveTypeScript A.defaultOptions ''PreviewStatus
 deriveTypeScript A.defaultOptions ''TaskSummary
 deriveTypeScript A.defaultOptions ''TaskRunInfo
 deriveTypeScript A.defaultOptions ''ArtifactDTO
+deriveTypeScript A.defaultOptions ''AcceptanceCriterionDTO
 deriveTypeScript A.defaultOptions ''StatusEventDTO
 deriveTypeScript A.defaultOptions ''TaskDetail
 deriveTypeScript A.defaultOptions ''TaskHistoryPage
@@ -343,6 +373,8 @@ deriveTypeScript A.defaultOptions ''AppSettingsDTO
 deriveTypeScript A.defaultOptions ''TaskCreateRequest
 deriveTypeScript A.defaultOptions ''TaskUpdateStatusRequest
 deriveTypeScript A.defaultOptions ''TaskTestCommandUpdateRequest
+deriveTypeScript A.defaultOptions ''TaskCriterionInput
+deriveTypeScript A.defaultOptions ''TaskCriteriaUpdateRequest
 deriveTypeScript A.defaultOptions ''SettingsUpdateRequest
 deriveTypeScript A.defaultOptions ''PromptUpdateRequest
 deriveTypeScript A.defaultOptions ''PromptResetRequest
@@ -366,6 +398,7 @@ deriveElmDef defaultOptions ''PreviewStatus
 deriveElmDef defaultOptions ''TaskSummary
 deriveElmDef defaultOptions ''TaskRunInfo
 deriveElmDef defaultOptions ''ArtifactDTO
+deriveElmDef defaultOptions ''AcceptanceCriterionDTO
 deriveElmDef defaultOptions ''StatusEventDTO
 deriveElmDef defaultOptions ''TaskDetail
 deriveElmDef defaultOptions ''TaskHistoryPage
@@ -375,6 +408,8 @@ deriveElmDef defaultOptions ''AppSettingsDTO
 deriveElmDef defaultOptions ''TaskCreateRequest
 deriveElmDef defaultOptions ''TaskUpdateStatusRequest
 deriveElmDef defaultOptions ''TaskTestCommandUpdateRequest
+deriveElmDef defaultOptions ''TaskCriterionInput
+deriveElmDef defaultOptions ''TaskCriteriaUpdateRequest
 deriveElmDef defaultOptions ''SettingsUpdateRequest
 deriveElmDef defaultOptions ''PromptUpdateRequest
 deriveElmDef defaultOptions ''PromptResetRequest
@@ -400,6 +435,7 @@ elmDefinitions =
   , DefineElm (Proxy :: Proxy TaskSummary)
   , DefineElm (Proxy :: Proxy TaskRunInfo)
   , DefineElm (Proxy :: Proxy ArtifactDTO)
+  , DefineElm (Proxy :: Proxy AcceptanceCriterionDTO)
   , DefineElm (Proxy :: Proxy StatusEventDTO)
   , DefineElm (Proxy :: Proxy TaskDetail)
   , DefineElm (Proxy :: Proxy PromptTemplateDTO)
@@ -408,6 +444,8 @@ elmDefinitions =
   , DefineElm (Proxy :: Proxy TaskCreateRequest)
   , DefineElm (Proxy :: Proxy TaskUpdateStatusRequest)
   , DefineElm (Proxy :: Proxy TaskTestCommandUpdateRequest)
+  , DefineElm (Proxy :: Proxy TaskCriterionInput)
+  , DefineElm (Proxy :: Proxy TaskCriteriaUpdateRequest)
   , DefineElm (Proxy :: Proxy SettingsUpdateRequest)
   , DefineElm (Proxy :: Proxy PromptUpdateRequest)
   , DefineElm (Proxy :: Proxy PromptResetRequest)

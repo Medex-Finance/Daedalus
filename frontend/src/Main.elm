@@ -4,8 +4,8 @@ import Browser
 import Browser.Navigation as Nav
 import Dict exposing (Dict)
 import Generated.Api as Api exposing (AgentRole(..), ArtifactKind(..), PreviewStatus(..), TaskStatus(..), WorkerMetricDTO, WorkerStatusStateDTO(..), WorkflowStep(..))
-import Html exposing (Html, a, button, div, form, h1, h2, h3, h4, input, label, li, main_, nav, option, p, pre, section, select, span, strong, text, textarea, ul)
-import Html.Attributes exposing (checked, class, disabled, href, min, placeholder, rel, target, type_, value)
+import Html exposing (Html, a, button, div, form, h1, h2, h3, h4, img, input, label, li, main_, nav, option, p, pre, section, select, span, strong, text, textarea, ul)
+import Html.Attributes exposing (alt, checked, class, disabled, href, min, placeholder, rel, src, target, type_, value)
 import Html.Events exposing (onCheck, onClick, onInput, onSubmit)
 import Html.Lazy as Lazy
 import Http
@@ -128,6 +128,7 @@ type alias TaskDetailModel =
     , testCommandState : RequestState
     , qaSkipState : RequestState
     , previewStartState : RequestState
+    , verifierStartState : RequestState
     , message : String
     , messageState : RequestState
     , messageTargetRole : Maybe AgentRole
@@ -145,6 +146,11 @@ type alias TaskDetailModel =
     , snapshot : RemoteData OrchestratorSnapshot
     , historyState : RequestState
     , historyRequest : Maybe HistoryRequestOrigin
+    , criteriaDraft : List AcceptanceCriterion
+    , newCriterionDraft : String
+    , criteriaState : RequestState
+    , criteriaDirty : Bool
+    , nextCriterionId : Int
     }
 
 
@@ -318,11 +324,20 @@ type alias StatusEvent =
 
 
 type alias Artifact =
-    { kind : ArtifactKind
+    { id : Int
+    , kind : ArtifactKind
     , label : String
     , body : Maybe Decode.Value
     , path : Maybe String
     , createdAt : Posix
+    }
+
+
+type alias AcceptanceCriterion =
+    { id : Int
+    , body : String
+    , isMet : Bool
+    , ordinal : Int
     }
 
 
@@ -344,6 +359,7 @@ type alias TaskDetail =
     , runs : List TaskRun
     , events : List StatusEvent
     , artifacts : List Artifact
+    , criteria : List AcceptanceCriterion
     , testCommand : String
     , testCommandOverride : Maybe String
     , isPaused : Bool
@@ -531,6 +547,11 @@ hydrateDetailModel detailModel detail =
         , timelineNextCursor = detail.eventNextCursor
         , historyState = Idle
         , historyRequest = Nothing
+        , criteriaDraft = normalizeCriteria sanitizedDetail.criteria
+        , newCriterionDraft = ""
+        , criteriaDirty = False
+        , nextCriterionId = -1
+        , criteriaState = Idle
     }
 
 
@@ -641,12 +662,66 @@ fromApiStatusEvent dto =
 
 fromApiArtifact : Api.ArtifactDTO -> Artifact
 fromApiArtifact artifact =
-    { kind = artifact.artifactKind
+    { id = artifact.artifactId
+    , kind = artifact.artifactKind
     , label = artifact.artifactLabel
     , body = artifact.artifactBody
     , path = artifact.artifactPath
     , createdAt = artifact.artifactCreatedAt
     }
+
+
+fromApiAcceptanceCriterion : Api.AcceptanceCriterionDTO -> AcceptanceCriterion
+fromApiAcceptanceCriterion dto =
+    { id = dto.criterionId
+    , body = dto.criterionBody
+    , isMet = dto.criterionIsMet
+    , ordinal = dto.criterionOrdinal
+    }
+
+
+normalizeCriteria : List AcceptanceCriterion -> List AcceptanceCriterion
+normalizeCriteria criteria =
+    criteria
+        |> List.sortBy .ordinal
+        |> List.indexedMap
+            (\index item ->
+                { item | ordinal = index + 1 }
+            )
+
+
+updateCriteriaDraft : (List AcceptanceCriterion -> List AcceptanceCriterion) -> TaskDetailModel -> TaskDetailModel
+updateCriteriaDraft transform detailModel =
+    let
+        updatedList =
+            normalizeCriteria (transform detailModel.criteriaDraft)
+
+        nextState =
+            case detailModel.criteriaState of
+                Working ->
+                    Working
+
+                _ ->
+                    Idle
+    in
+    { detailModel
+        | criteriaDraft = updatedList
+        , criteriaDirty = True
+        , criteriaState = nextState
+    }
+
+
+updateCriterionInList : Int -> (AcceptanceCriterion -> AcceptanceCriterion) -> List AcceptanceCriterion -> List AcceptanceCriterion
+updateCriterionInList targetId updater list =
+    List.map
+        (\criterion ->
+            if criterion.id == targetId then
+                updater criterion
+
+            else
+                criterion
+        )
+        list
 
 
 fromApiTaskDetail : Api.TaskDetail -> TaskDetail
@@ -655,6 +730,7 @@ fromApiTaskDetail detail =
     , runs = List.map fromApiTaskRun detail.taskDetailRuns
     , events = List.map fromApiStatusEvent detail.taskDetailEvents
     , artifacts = List.map fromApiArtifact detail.taskDetailArtifacts
+    , criteria = normalizeCriteria (List.map fromApiAcceptanceCriterion detail.taskDetailCriteria)
     , testCommand = detail.taskDetailTestCommand
     , testCommandOverride = detail.taskDetailTestCommandOverride
     , isPaused = detail.taskDetailIsPaused
@@ -910,6 +986,9 @@ agentRoleLabel role =
         AgentRoleQa ->
             "QA"
 
+        AgentRoleVerifier ->
+            "Verifier"
+
 
 roleKey : AgentRole -> String
 roleKey role =
@@ -922,6 +1001,9 @@ roleKey role =
 
         AgentRoleQa ->
             "qa"
+
+        AgentRoleVerifier ->
+            "verifier"
 
 
 addAgentLog : AgentLogEntry -> AgentLogs -> AgentLogs
@@ -1042,11 +1124,21 @@ statusEventDecoder =
 artifactDecoder : Decoder Artifact
 artifactDecoder =
     Decode.succeed Artifact
+        |> andMap (Decode.field "artifactId" Decode.int)
         |> andMap (Decode.field "artifactKind" Api.jsonDecArtifactKind)
         |> andMap (Decode.field "artifactLabel" Decode.string)
         |> andMap (Decode.field "artifactBody" (Decode.nullable Api.jsonDecValue))
         |> andMap (Decode.field "artifactPath" (Decode.nullable Decode.string))
         |> andMap (Decode.field "artifactCreatedAt" Api.jsonDecPosix)
+
+
+acceptanceCriterionDecoder : Decoder AcceptanceCriterion
+acceptanceCriterionDecoder =
+    Decode.succeed AcceptanceCriterion
+        |> andMap (Decode.field "criterionId" Decode.int)
+        |> andMap (Decode.field "criterionBody" Decode.string)
+        |> andMap (Decode.field "criterionIsMet" Decode.bool)
+        |> andMap (Decode.field "criterionOrdinal" Decode.int)
 
 
 taskDetailDecoder : Decoder TaskDetail
@@ -1056,6 +1148,7 @@ taskDetailDecoder =
         |> andMap (Decode.field "taskDetailRuns" (Decode.list taskRunDecoder))
         |> andMap (Decode.field "taskDetailEvents" (Decode.list statusEventDecoder))
         |> andMap (Decode.field "taskDetailArtifacts" (Decode.list artifactDecoder))
+        |> andMap (Decode.field "taskDetailCriteria" (Decode.list acceptanceCriterionDecoder))
         |> andMap (Decode.field "taskDetailTestCommand" Decode.string)
         |> andMap (Decode.field "taskDetailTestCommandOverride" (Decode.nullable Decode.string))
         |> andMap (Decode.field "taskDetailIsPaused" Decode.bool)
@@ -1222,10 +1315,19 @@ type Msg
     | SaveTestCommand
     | ClearTestCommand
     | TestCommandSaved (Result Http.Error TaskDetail)
+    | UpdateCriterionBody Int String
+    | ToggleCriterion Int
+    | RemoveCriterion Int
+    | UpdateNewCriterion String
+    | AddCriterion
+    | SaveCriteria
+    | CriteriaSaved (Result Http.Error TaskDetail)
     | SkipQa
     | QaSkipped (Result Http.Error TaskDetail)
     | StartPreview
     | PreviewStarted (Result Http.Error TaskDetail)
+    | StartVerifier
+    | VerifierStarted (Result Http.Error TaskDetail)
     | ReceiveStatusEvent Decode.Value
     | ShowMoreTimeline
     | CollapseTimeline
@@ -1447,6 +1549,7 @@ update msg model =
                                             | testCommandState = Idle
                                             , qaSkipState = Idle
                                             , previewStartState = Idle
+                                            , verifierStartState = Idle
                                             , retryState = Idle
                                             , pauseState = Idle
                                             , reassignState = Idle
@@ -1587,6 +1690,7 @@ update msg model =
                                         , testCommandState = Idle
                                         , qaSkipState = Idle
                                         , previewStartState = Idle
+                                        , verifierStartState = Idle
                                     }
                             in
                             ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
@@ -1671,6 +1775,7 @@ update msg model =
                                         , testCommandState = Idle
                                         , qaSkipState = Idle
                                         , previewStartState = Idle
+                                        , verifierStartState = Idle
                                         , retryState = Idle
                                         , pauseState = Idle
                                         , reassignState = Idle
@@ -2123,12 +2228,133 @@ update msg model =
                                         | testCommandState = Completed
                                         , qaSkipState = Idle
                                         , previewStartState = Idle
+                                        , verifierStartState = Idle
                                     }
                             in
                             ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
 
                         Err err ->
                             ( { model | page = TaskDetailPage { detailModel | testCommandState = Failed (httpErrorToString err) } }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        UpdateCriterionBody criterionId newBody ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    let
+                        updated =
+                            updateCriteriaDraft
+                                (updateCriterionInList criterionId (\c -> { c | body = newBody }))
+                                detailModel
+                    in
+                    ( { model | page = TaskDetailPage updated }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        ToggleCriterion criterionId ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    let
+                        updated =
+                            updateCriteriaDraft
+                                (updateCriterionInList criterionId (\c -> { c | isMet = not c.isMet }))
+                                detailModel
+                    in
+                    ( { model | page = TaskDetailPage updated }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        RemoveCriterion criterionId ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    let
+                        updated =
+                            updateCriteriaDraft
+                                (\list -> List.filter (\c -> c.id /= criterionId) list)
+                                detailModel
+                    in
+                    ( { model | page = TaskDetailPage updated }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        UpdateNewCriterion str ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    ( { model | page = TaskDetailPage { detailModel | newCriterionDraft = str } }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        AddCriterion ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    let
+                        trimmed =
+                            String.trim detailModel.newCriterionDraft
+                    in
+                    if trimmed == "" then
+                        ( model, Cmd.none )
+
+                    else
+                        let
+                            newItem =
+                                { id = detailModel.nextCriterionId
+                                , body = trimmed
+                                , isMet = False
+                                , ordinal = List.length detailModel.criteriaDraft + 1
+                                }
+
+                            draftUpdated =
+                                updateCriteriaDraft (\list -> list ++ [ newItem ]) detailModel
+
+                            updatedModel =
+                                { draftUpdated
+                                    | newCriterionDraft = ""
+                                    , nextCriterionId = detailModel.nextCriterionId - 1
+                                }
+                        in
+                        ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        SaveCriteria ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    if detailModel.criteriaState == Working || not detailModel.criteriaDirty then
+                        ( model, Cmd.none )
+
+                    else
+                        ( { model | page = TaskDetailPage { detailModel | criteriaState = Working } }
+                        , updateTaskCriteria model detailModel.id detailModel.criteriaDraft
+                        )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        CriteriaSaved result ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    case result of
+                        Ok detail ->
+                            let
+                                hydrated =
+                                    hydrateDetailModel detailModel detail
+
+                                updatedModel =
+                                    { hydrated
+                                        | criteriaState = Completed
+                                        , criteriaDirty = False
+                                    }
+                            in
+                            ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
+
+                        Err err ->
+                            ( { model | page = TaskDetailPage { detailModel | criteriaState = Failed (httpErrorToString err) } }, Cmd.none )
 
                 _ ->
                     ( model, Cmd.none )
@@ -2161,6 +2387,7 @@ update msg model =
                                         | testCommandState = Idle
                                         , qaSkipState = Completed
                                         , previewStartState = Idle
+                                        , verifierStartState = Idle
                                     }
                             in
                             ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
@@ -2199,12 +2426,52 @@ update msg model =
                                         | previewStartState = Completed
                                         , qaSkipState = Idle
                                         , testCommandState = Idle
+                                        , verifierStartState = Idle
                                     }
                             in
                             ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
 
                         Err err ->
                             ( { model | page = TaskDetailPage { detailModel | previewStartState = Failed (httpErrorToString err) } }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        StartVerifier ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    if detailModel.verifierStartState == Working then
+                        ( model, Cmd.none )
+
+                    else
+                        ( { model | page = TaskDetailPage { detailModel | verifierStartState = Working } }
+                        , startVerifierRequest model detailModel.id
+                        )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        VerifierStarted result ->
+            case model.page of
+                TaskDetailPage detailModel ->
+                    case result of
+                        Ok detail ->
+                            let
+                                hydrated =
+                                    hydrateDetailModel detailModel detail
+
+                                updatedModel =
+                                    { hydrated
+                                        | verifierStartState = Completed
+                                        , qaSkipState = Idle
+                                        , testCommandState = Idle
+                                        , previewStartState = Idle
+                                    }
+                            in
+                            ( { model | page = TaskDetailPage updatedModel }, Cmd.none )
+
+                        Err err ->
+                            ( { model | page = TaskDetailPage { detailModel | verifierStartState = Failed (httpErrorToString err) } }, Cmd.none )
 
                 _ ->
                     ( model, Cmd.none )
@@ -3050,6 +3317,9 @@ messageRoleFromString str =
         "qa" ->
             Just AgentRoleQa
 
+        "verifier" ->
+            Just AgentRoleVerifier
+
         _ ->
             Nothing
 
@@ -3113,6 +3383,9 @@ roleSelectValue maybeRole =
 
         Just AgentRoleQa ->
             "qa"
+
+        Just AgentRoleVerifier ->
+            "verifier"
 
         Nothing ->
             ""
@@ -3197,6 +3470,7 @@ changeRoute route model =
                     , testCommandState = Idle
                     , qaSkipState = Idle
                     , previewStartState = Idle
+                    , verifierStartState = Idle
                     , message = ""
                     , messageState = Idle
                     , messageTargetRole = Nothing
@@ -3214,6 +3488,11 @@ changeRoute route model =
                     , snapshot = Loading
                     , historyState = Idle
                     , historyRequest = Nothing
+                    , criteriaDraft = []
+                    , newCriterionDraft = ""
+                    , criteriaState = Idle
+                    , criteriaDirty = False
+                    , nextCriterionId = -1
                     }
 
                 openCmd =
@@ -3622,6 +3901,36 @@ updateTaskTestCommand model taskId maybeCommand =
         taskDetailDecoder
 
 
+updateTaskCriteria : Model -> Int -> List AcceptanceCriterion -> Cmd Msg
+updateTaskCriteria model taskId criteria =
+    let
+        encodeCriterion item =
+            Encode.object
+                [ ( "criterionId"
+                  , if item.id > 0 then
+                        Encode.int item.id
+
+                    else
+                        Encode.null
+                  )
+                , ( "criterionBody", Encode.string item.body )
+                , ( "criterionIsMet", Encode.bool item.isMet )
+                ]
+
+        payload =
+            Encode.object
+                [ ( "taskCriteriaItems"
+                  , Encode.list encodeCriterion criteria
+                  )
+                ]
+    in
+    putJson
+        (apiUrl model ("/tasks/" ++ String.fromInt taskId ++ "/criteria"))
+        payload
+        CriteriaSaved
+        taskDetailDecoder
+
+
 pingPreview : Model -> Int -> Cmd Msg
 pingPreview model taskId =
     plainPost (apiUrl model ("/preview/" ++ String.fromInt taskId ++ "/ping"))
@@ -3651,6 +3960,13 @@ startPreviewRequest model taskId =
     plainPost (apiUrl model ("/tasks/" ++ String.fromInt taskId ++ "/preview/start"))
         (Encode.object [])
         PreviewStarted
+        taskDetailDecoder
+
+startVerifierRequest : Model -> Int -> Cmd Msg
+startVerifierRequest model taskId =
+    plainPost (apiUrl model ("/tasks/" ++ String.fromInt taskId ++ "/verifier/start"))
+        (Encode.object [])
+        VerifierStarted
         taskDetailDecoder
 
 
@@ -4406,6 +4722,7 @@ viewTaskDetail model =
     in
     div [ class "space-y-8 p-8" ]
         [ Lazy.lazy viewTaskSummary model.detail
+        , Lazy.lazy viewAcceptanceCriteria model
         , div [ class "grid gap-6 lg:grid-cols-[2fr,1fr]" ]
             [ leftColumn
             , rightColumn
@@ -4618,6 +4935,133 @@ viewTaskSummary data =
             text ""
 
 
+viewAcceptanceCriteria : TaskDetailModel -> Html Msg
+viewAcceptanceCriteria model =
+    case model.detail of
+        Success _ ->
+            let
+                criteriaList =
+                    if List.isEmpty model.criteriaDraft then
+                        p [ class "text-sm text-slate-400" ] [ text "No acceptance criteria yet. Use the form below to add the requirements the verifier should check." ]
+
+                    else
+                        ul [ class "mt-4 space-y-3" ] (List.map (viewCriterionRow model.criteriaState) model.criteriaDraft)
+
+                addDisabled =
+                    String.trim model.newCriterionDraft == ""
+                        || model.criteriaState == Working
+
+                saveDisabled =
+                    (not model.criteriaDirty) || model.criteriaState == Working
+
+                stateNotice =
+                    case model.criteriaState of
+                        Failed err ->
+                            Just (p [ class "text-xs text-rose-300" ] [ text err ])
+
+                        Completed ->
+                            Just (p [ class "text-xs text-emerald-300" ] [ text "Acceptance criteria updated." ])
+
+                        Working ->
+                            Just (p [ class "text-xs text-slate-300" ] [ text "Saving…" ])
+
+                        Idle ->
+                            Nothing
+
+                unsavedHint =
+                    if model.criteriaDirty then
+                        span [ class "text-xs text-slate-400" ] [ text "You have unsaved changes." ]
+
+                    else
+                        text ""
+            in
+            section [ class "rounded-xl border border-slate-900 bg-slate-900/80 p-6" ]
+                [ h3 [ class "text-lg font-semibold" ] [ text "Acceptance Criteria" ]
+                , p [ class "mt-2 text-xs text-slate-400" ]
+                    [ text "Define the checklist the verifier must satisfy before approving this task." ]
+                , criteriaList
+                , div [ class "mt-4 flex flex-col gap-2 md:flex-row" ]
+                    [ input
+                        [ class "flex-1 rounded bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        , placeholder "Add a new criterion…"
+                        , value model.newCriterionDraft
+                        , onInput UpdateNewCriterion
+                        , disabled (model.criteriaState == Working)
+                        ]
+                        []
+                    , button
+                        [ class "rounded bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+                        , disabled addDisabled
+                        , onClick AddCriterion
+                        ]
+                        [ text "Add" ]
+                    ]
+                , div [ class "mt-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between" ]
+                    [ div [ class "flex items-center gap-3" ]
+                        [ button
+                            [ class "rounded bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-40"
+                            , disabled saveDisabled
+                            , onClick SaveCriteria
+                            ]
+                            [ text
+                                (if model.criteriaState == Working then
+                                    "Saving…"
+
+                                 else
+                                    "Save Criteria"
+                                )
+                            ]
+                        , unsavedHint
+                        ]
+                    , Maybe.withDefault (text "") stateNotice
+                    ]
+                ]
+
+        Loading ->
+            section [ class "rounded-xl border border-slate-900 bg-slate-900/80 p-6" ]
+                [ h3 [ class "text-lg font-semibold" ] [ text "Acceptance Criteria" ]
+                , p [ class "mt-2 text-sm text-slate-400" ] [ text "Loading…" ]
+                ]
+
+        Failure err ->
+            section [ class "rounded-xl border border-slate-900 bg-slate-900/80 p-6 text-rose-300" ]
+                [ h3 [ class "text-lg font-semibold" ] [ text "Acceptance Criteria" ]
+                , p [ class "mt-2 text-sm" ] [ text err ]
+                ]
+
+        NotAsked ->
+            text ""
+
+
+viewCriterionRow : RequestState -> AcceptanceCriterion -> Html Msg
+viewCriterionRow criteriaState criterion =
+    li [ class "rounded border border-slate-800 bg-slate-950/80 p-3" ]
+        [ div [ class "flex flex-col gap-2 md:flex-row md:items-center md:justify-between" ]
+            [ div [ class "flex items-center gap-3 text-xs text-slate-400" ]
+                [ input
+                    [ type_ "checkbox"
+                    , checked criterion.isMet
+                    , disabled (criteriaState == Working)
+                    , onCheck (\_ -> ToggleCriterion criterion.id)
+                    ]
+                    []
+                , span [ class "font-semibold text-slate-200" ] [ text ("#" ++ String.fromInt criterion.ordinal) ]
+                ]
+            , button
+                [ class "text-[11px] uppercase tracking-wide text-slate-400 hover:text-rose-300"
+                , onClick (RemoveCriterion criterion.id)
+                ]
+                [ text "Remove" ]
+            ]
+        , input
+            [ class "mt-2 w-full rounded bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            , value criterion.body
+            , disabled (criteriaState == Working)
+            , onInput (UpdateCriterionBody criterion.id)
+            ]
+            []
+        ]
+
 viewTestCommand : TaskDetailModel -> Html Msg
 viewTestCommand model =
     case model.detail of
@@ -4744,7 +5188,11 @@ viewArtifacts data =
                     p [ class "mt-2 text-sm text-slate-400" ] [ text "No artifacts published yet." ]
 
                 else
-                    div [ class "mt-4 space-y-3" ] (List.map viewArtifactCard detail.artifacts)
+                    let
+                        taskId =
+                            detail.summary.id
+                    in
+                    div [ class "mt-4 space-y-3" ] (List.map (viewArtifactCard taskId) detail.artifacts)
         ]
 
 
@@ -4772,9 +5220,45 @@ artifactKindText kind =
         ArtifactAgentTranscript ->
             "Transcript"
 
+        ArtifactScreenshot ->
+            "Screenshot"
 
-viewArtifactCard : Artifact -> Html Msg
-viewArtifactCard artifact =
+        ArtifactVerificationEvidence ->
+            "Verification Evidence"
+
+        ArtifactVerifierReport ->
+            "Verifier Report"
+
+
+artifactDownloadUrl : Int -> Int -> String
+artifactDownloadUrl taskId artifactId =
+    "/api/tasks/" ++ String.fromInt taskId ++ "/artifacts/" ++ String.fromInt artifactId ++ "/file"
+
+
+viewArtifactCard : Int -> Artifact -> Html Msg
+viewArtifactCard taskId artifact =
+    let
+        downloadUrl =
+            artifactDownloadUrl taskId artifact.id
+
+        hasFile =
+            artifact.path /= Nothing
+
+        screenshotPreview =
+            case ( artifact.kind, hasFile ) of
+                ( ArtifactScreenshot, True ) ->
+                    div [ class "mt-3" ]
+                        [ img
+                            [ src downloadUrl
+                            , alt (artifact.label ++ " screenshot")
+                            , class "max-h-72 rounded border border-slate-800 object-contain"
+                            ]
+                            []
+                        ]
+
+                _ ->
+                    text ""
+    in
     div [ class "rounded border border-slate-800 bg-slate-950/60 p-4" ]
         [ div [ class "flex items-center justify-between" ]
             [ span [ class "text-sm font-semibold text-slate-200" ] [ text artifact.label ]
@@ -4782,11 +5266,21 @@ viewArtifactCard artifact =
             ]
         , case artifact.path of
             Just pathStr ->
-                span [ class "mt-1 block text-[11px] text-slate-400" ] [ text pathStr ]
+                div [ class "mt-1 flex flex-wrap items-center gap-3 text-[11px] text-slate-400" ]
+                    [ span [ class "break-all" ] [ text pathStr ]
+                    , a
+                        [ class "rounded border border-slate-700 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-indigo-300 hover:text-indigo-100"
+                        , href downloadUrl
+                        , target "_blank"
+                        , rel "noreferrer"
+                        ]
+                        [ text "Open file" ]
+                    ]
 
             Nothing ->
                 text ""
         , span [ class "mt-1 block text-[11px] text-slate-500" ] [ text (formatTimestamp artifact.createdAt) ]
+        , screenshotPreview
         , case artifact.body of
             Nothing ->
                 text ""
@@ -4806,7 +5300,7 @@ viewAgentLogs model =
             model.agentLogVisible
 
         roles =
-            [ AgentRoleProjectManager, AgentRoleImplementer, AgentRoleQa ]
+            [ AgentRoleProjectManager, AgentRoleImplementer, AgentRoleQa, AgentRoleVerifier ]
 
         loadingMore =
             model.historyState == Working
@@ -5284,6 +5778,9 @@ viewWorkflowControls model =
         previewWorking =
             model.previewStartState == Working
 
+        verifierWorking =
+            model.verifierStartState == Working
+
         previewDisabled =
             case model.detail of
                 Success detail ->
@@ -5309,6 +5806,20 @@ viewWorkflowControls model =
 
                     else
                         "Start Preview"
+
+        verifierLabel =
+            case model.verifierStartState of
+                Working ->
+                    "Starting verifier…"
+
+                Failed _ ->
+                    "Retry Verifier"
+
+                Completed ->
+                    "Verifier requested"
+
+                Idle ->
+                    "Start Verifier"
 
         pauseLabel =
             case ( isPaused, model.pauseState ) of
@@ -5365,6 +5876,8 @@ viewWorkflowControls model =
                 , viewRequestNotice model.qaSkipState "QA skipped."
                 , actionButton TonePrimary previewDisabled StartPreview previewLabel
                 , viewRequestNotice model.previewStartState "Preview requested."
+                , actionButton TonePrimary verifierWorking StartVerifier verifierLabel
+                , viewRequestNotice model.verifierStartState "Verifier requested."
                 ]
             , workerSection model isPaused pauseLabel pauseWorking reassignWorking
             ]

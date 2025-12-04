@@ -190,6 +190,7 @@ rolePrefix :: AgentRole -> Text
 rolePrefix AgentRoleProjectManager = "Project manager agent run"
 rolePrefix AgentRoleImplementer = "Implementation agent run"
 rolePrefix AgentRoleQa = "QA agent run"
+rolePrefix AgentRoleVerifier = "Verifier agent run"
 
 snippet :: Text -> Text -> Text
 snippet stdoutTxt stderrTxt

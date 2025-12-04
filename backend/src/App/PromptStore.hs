@@ -44,6 +44,14 @@ promptSeeds =
           "If the work is complete and correct, exit successfully with a concise approval summary.",
           "If gaps remain, exit with a failure status and list the missing items so implementation can try again." ]
     )
+  , ( "verifier"
+    , "Autonomous verifier agent"
+    , T.unlines
+        [ "You act as an automated CTO-grade verifier."
+        , "Inspect the task context, acceptance criteria, diffs, tests, preview telemetry, and evidence artifacts."
+        , "Cite concrete artifacts (by label) when declaring success. Fail fast if any requirement is unmet."
+        , "Only approve when evidence proves the feature works end-to-end." ]
+    )
   , ( "qa_reviewer"
     , "QA and security reviewer"
     , T.unlines

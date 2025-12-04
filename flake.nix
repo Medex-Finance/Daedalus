@@ -53,10 +53,35 @@
             pkgs.haskellPackages.ormolu
             pkgs.haskellPackages.aeson-typescript
             pkgs.haskellPackages.fast-logger
+            # Playwright runtime deps + managed browsers
+            pkgs.playwright-driver.browsers
+            pkgs.chromium
+            pkgs.glib
+            pkgs.nspr
+            pkgs.nss
+            pkgs.dbus
+            pkgs.gtk3
+            pkgs.at-spi2-core
+            pkgs.mesa
+            pkgs.alsa-lib
+            pkgs.libdrm
+            pkgs.udev
+            pkgs.libxkbcommon
+            pkgs.xorg.libX11
+            pkgs.xorg.libXcomposite
+            pkgs.xorg.libXdamage
+            pkgs.xorg.libXext
+            pkgs.xorg.libXfixes
+            pkgs.xorg.libXrandr
+            pkgs.xorg.libxcb
           ];
           shellHook = ''
             export CABAL_DIR=$PWD/dist-newstyle
             export PATH=$PWD/node_modules/.bin:$PATH
+            export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+            export CHROMIUM_PATH=$(find ${pkgs.playwright-driver.browsers} -path '*chrome-linux/chrome' -type f -print -quit)
+            export PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH="$CHROMIUM_PATH"
             echo "Dev shell ready: run cabal build && pnpm dev"
           '';
         };

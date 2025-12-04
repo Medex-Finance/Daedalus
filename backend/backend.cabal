@@ -31,6 +31,7 @@ library
       App.Foundation
     , App.Application
     , App.Models
+    , App.Evidence
     , App.Settings
     , App.PromptStore
     , App.Orchestrator
@@ -44,6 +45,8 @@ library
     , App.Queue
     , App.Logging
     , App.Migrations
+    , App.Gemini
+    , App.RepoProfiles
   hs-source-dirs:   src
   default-language: Haskell2010
   ghc-options:      -Wall
@@ -52,9 +55,12 @@ library
     , orchestrator-types
     , aeson >=2.1
     , aeson-typescript >=0.6
+    , aeson-pretty
     , async
+    , base64-bytestring
     , bytestring
     , conduit
+    , JuicyPixels
     , containers
     , directory
     , filepath
@@ -63,6 +69,7 @@ library
     , http-client
     , http-client-tls
     , http-types
+    , mime-types
     , monad-logger
     , persistent
     , persistent-sqlite
@@ -72,6 +79,7 @@ library
     , transformers
     , typed-process
     , unordered-containers
+    , vector
     , stm
     , unliftio
     , unliftio-core
@@ -126,6 +134,7 @@ test-suite integration
   hs-source-dirs:    test
   main-is:           Spec.hs
   other-modules:     OrchestratorSpec
+                   , EvidenceSpec
   default-language:  Haskell2010
   ghc-options:       -Wall
   build-depends:
@@ -133,7 +142,11 @@ test-suite integration
     , orchestrator-backend
     , orchestrator-types
     , aeson
+    , aeson-pretty
+    , bytestring
     , containers
+    , directory
+    , filepath
     , hspec
     , monad-logger
     , persistent
@@ -142,4 +155,5 @@ test-suite integration
     , stm
     , text
     , time
+    , temporary
     , yesod-static

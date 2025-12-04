@@ -6,6 +6,10 @@ module App.Preview
   , teardownPreview
   , recordPreviewPing
   , previewUrlForTask
+  , pingPreview
+  , markPreviewFailed
+  , markPreviewOnline
+  , isPreviewProcessAlive
   ) where
 
 import App.Foundation (App(..))
@@ -13,6 +17,7 @@ import App.Models
 import App.ProcessDispatcher (launchServiceInDir)
 import App.Types (AgentRole(..), AppSettingsDTO(..), ArtifactKind(..), PreviewStatus(..), WorkflowStep(..))
 import App.Worktree (WorktreeContext(..), locateWorktree)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (readTVarIO)
 import Control.Exception (SomeException, try)
 import Control.Monad (void)
@@ -41,7 +46,7 @@ previewUrlForTask taskId =
   T.pack $ "http://localhost:" <> show (previewPortForTask taskId)
 
 startPreview :: App -> TaskId -> IO (Either Text Text)
-startPreview app@App { appConnPool, appSettingsVar } taskId = do
+startPreview app@App { appConnPool, appSettingsVar, appManager } taskId = do
   mTask <- runSqlPool (get taskId) appConnPool
   case mTask of
     Nothing -> pure (Left "Task not found")
@@ -79,7 +84,13 @@ startPreview app@App { appConnPool, appSettingsVar } taskId = do
                     }
                   storeLaunchArtifact "preview-launch" taskId cmd port pid (T.pack logPath) now
                 ) appConnPool
-              pure (Right url)
+              readiness <- awaitReadiness appManager appConnPool taskId url pid
+              case readiness of
+                Left err -> do
+                  markPreviewFailed appConnPool taskId err (Just pid)
+                  pure (Left err)
+                Right () ->
+                  pure (Right url)
   where
     failWith :: Text -> IO (Either Text Text)
     failWith msg = do
@@ -152,7 +163,7 @@ teardownPreview pool taskId = do
 
 recordPreviewPing :: ConnectionPool -> Manager -> TaskId -> Text -> IO PreviewStatus
 recordPreviewPing pool manager taskId url = do
-  status <- ping manager url
+  status <- pingPreview manager url
   now <- getCurrentTime
   runSqlPool
     (do
@@ -178,8 +189,8 @@ recordPreviewPing pool manager taskId url = do
       pure status
     ) pool
 
-ping :: Manager -> Text -> IO PreviewStatus
-ping manager url = do
+pingPreview :: Manager -> Text -> IO PreviewStatus
+pingPreview manager url = do
   result <- try @SomeException $ do
     req <- parseRequest (T.unpack url)
     resp <- httpLbs req manager
@@ -187,3 +198,73 @@ ping manager url = do
   pure $ case result of
     Left _ -> PreviewFailed
     Right status -> status
+
+markPreviewFailed :: ConnectionPool -> TaskId -> Text -> Maybe Int -> IO ()
+markPreviewFailed pool taskId reason mPid = do
+  now <- getCurrentTime
+  runSqlPool
+    (do
+      update taskId
+        [ TaskPreviewStatus =. PreviewFailed
+        , TaskPreviewUrl =. Nothing
+        , TaskUpdatedAt =. now
+        ]
+      updateWhere [PreviewProcessTaskId ==. taskId]
+        [ PreviewProcessStatus =. PreviewFailed
+        , PreviewProcessLastHealthCheck =. Just now
+        ]
+      _ <- insert Artifact
+        { artifactTaskId = taskId
+        , artifactKind = ArtifactPreviewLog
+        , artifactLabel = "preview-health"
+        , artifactContent = Just $ object
+            [ "reason" .= reason
+            , "pid" .= mPid
+            ]
+        , artifactPath = Nothing
+        , artifactCreatedAt = now
+        }
+      pure ()
+    ) pool
+
+markPreviewOnline :: ConnectionPool -> TaskId -> IO ()
+markPreviewOnline pool taskId = do
+  now <- getCurrentTime
+  runSqlPool
+    (do
+      update taskId
+        [ TaskPreviewStatus =. PreviewOnline
+        , TaskUpdatedAt =. now
+        ]
+      updateWhere [PreviewProcessTaskId ==. taskId]
+        [ PreviewProcessStatus =. PreviewOnline
+        , PreviewProcessLastHealthCheck =. Just now
+        ]
+    ) pool
+
+awaitReadiness :: Manager -> ConnectionPool -> TaskId -> Text -> Int -> IO (Either Text ())
+awaitReadiness manager pool taskId url pid = loop (5 :: Int)
+  where
+    delayMicros = 2 * 1000000
+    loop 0 = pure (Left "Preview did not become healthy before timeout")
+    loop n = do
+      alive <- isPreviewProcessAlive pid
+      if not alive
+        then pure (Left "Preview process exited before health checks passed")
+        else do
+          status <- recordPreviewPing pool manager taskId url
+          case status of
+            PreviewOnline -> pure (Right ())
+            PreviewFailed -> pure (Left "Preview reported failed health check")
+            _ -> do
+              threadDelay delayMicros
+              loop (n - 1)
+
+isPreviewProcessAlive :: Int -> IO Bool
+isPreviewProcessAlive pid = do
+  let checkCmd = proc "bash" ["-lc", "kill -0 " <> show pid]
+  result <- try @SomeException (readCreateProcessWithExitCode checkCmd "")
+  pure $ case result of
+    Left _ -> False
+    Right (ExitSuccess, _, _) -> True
+    Right _ -> False

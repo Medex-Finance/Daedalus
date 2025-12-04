@@ -67,6 +67,15 @@ TaskRun
     updatedAt UTCTime default=CURRENT_TIMESTAMP
     deriving Show Eq
 
+TaskAcceptanceCriterion
+    taskId TaskId
+    ordinal Int
+    body Text
+    isMet Bool default=FALSE
+    createdAt UTCTime default=CURRENT_TIMESTAMP
+    updatedAt UTCTime default=CURRENT_TIMESTAMP
+    deriving Show Eq
+
 AgentSession
     taskRunId TaskRunId
     role AgentRole

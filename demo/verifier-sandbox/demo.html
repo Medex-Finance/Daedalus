@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Verifier Demo Surface</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="card">
+      <header class="header-row">
+        <div>
+          <h1>Welcome to the Demo App</h1>
+          <p class="subtitle">This surface is captured by Playwright for verifier evidence.</p>
+        </div>
+        <div id="status-chip" class="chip chip--pending" aria-live="polite">
+          In Progress
+        </div>
+      </header>
+      <section class="grid">
+        <article class="panel">
+          <h2>Status</h2>
+          <p id="completion-status" data-complete="false">All systems nominal. Waiting for completion.</p>
+          <ul>
+            <li>API latency under 120ms</li>
+            <li>Queue depth = 4</li>
+            <li>QA checks passing</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h2>Next Actions</h2>
+          <ol id="checklist">
+            <li>Review acceptance criteria</li>
+            <li>Trigger automated verifier</li>
+            <li>Publish QA notes</li>
+          </ol>
+          <button id="complete-btn" aria-label="Mark the checklist complete">Mark Complete</button>
+          <div id="success-banner" class="success" hidden>
+            <strong>Completed!</strong> All actions are done and the state is saved.
+          </div>
+        </article>
+      </section>
+    </main>
+    <script>
+      const statusChip = document.getElementById('status-chip');
+      const completionStatus = document.getElementById('completion-status');
+      const checklist = document.getElementById('checklist');
+      const completeBtn = document.getElementById('complete-btn');
+      const successBanner = document.getElementById('success-banner');
+
+      const markComplete = () => {
+        const alreadyDone = completionStatus.dataset.complete === 'true';
+        if (alreadyDone) return;
+        completionStatus.dataset.complete = 'true';
+        completionStatus.textContent = 'All systems nominal. Completion confirmed.';
+        statusChip.textContent = 'Completed';
+        statusChip.classList.remove('chip--pending');
+        statusChip.classList.add('chip--done');
+        checklist.classList.add('completed');
+        completeBtn.textContent = 'Done';
+        completeBtn.disabled = true;
+        successBanner.hidden = false;
+      };
+
+      completeBtn.addEventListener('click', markComplete);
+    </script>
+  </body>
+</html>

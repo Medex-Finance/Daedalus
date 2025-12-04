@@ -3,11 +3,11 @@ type TaskStatus = "TaskStatusPending" | "TaskStatusDesigning" | "TaskStatusImple
 
 type WorkflowStep = "StepIntake" | "StepDesign" | "StepImplementation" | "StepSpecVerification" | "StepPmReview" | "StepQaReview" | "StepFixIteration" | "StepCommit" | "StepPreview" | "StepFinalize";
 
-type AgentRole = "AgentRoleProjectManager" | "AgentRoleImplementer" | "AgentRoleQa";
+type AgentRole = "AgentRoleProjectManager" | "AgentRoleImplementer" | "AgentRoleQa" | "AgentRoleVerifier";
 
 type AgentSessionStatus = "AgentSessionIdle" | "AgentSessionRunning" | "AgentSessionSucceeded" | "AgentSessionErrored";
 
-type ArtifactKind = "ArtifactDesign" | "ArtifactDiff" | "ArtifactTestLog" | "ArtifactCommitLog" | "ArtifactPreviewLog" | "ArtifactPreviewPing" | "ArtifactAgentTranscript";
+type ArtifactKind = "ArtifactDesign" | "ArtifactDiff" | "ArtifactTestLog" | "ArtifactCommitLog" | "ArtifactPreviewLog" | "ArtifactPreviewPing" | "ArtifactAgentTranscript" | "ArtifactScreenshot" | "ArtifactVerificationEvidence" | "ArtifactVerifierReport";
 
 type PreviewStatus = "PreviewOffline" | "PreviewLaunching" | "PreviewOnline" | "PreviewFailed";
 
@@ -40,6 +40,7 @@ interface ITaskRunInfo {
 type ArtifactDTO = IArtifactDTO;
 
 interface IArtifactDTO {
+  artifactId: number;
   artifactKind: ArtifactKind;
   artifactLabel: string;
   artifactBody: any | null;
@@ -64,6 +65,7 @@ interface ITaskDetail {
   taskDetailRuns: TaskRunInfo[];
   taskDetailEvents: StatusEventDTO[];
   taskDetailArtifacts: ArtifactDTO[];
+  taskDetailCriteria: AcceptanceCriterionDTO[];
   taskDetailTestCommand: string;
   taskDetailTestCommandOverride: string | null;
   taskDetailIsPaused: boolean;

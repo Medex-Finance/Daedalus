@@ -39,6 +39,24 @@ Run `./scripts/generate-types.sh` from the repo root to regenerate TypeScript de
 - `cabal run seed` provides three example tasks for UI testing.
 - Agent execution uses the Codex CLI (`codex exec --full-auto`). Install `@openai/codex`, run `codex login --api-key <OPENAI_KEY>`, and ensure the `codex` binary is on `PATH` (override with `CODEX_CLI` if needed). Codex writes transcripts into task artifacts so you can review each step.
 - The task timeline streams Codex stdout/stderr in real time via SSE; the UI auto-refreshes status, artifacts, and logs without manual reloads.
+- The `StepSpecVerification` phase now runs a dedicated verifier agent. Before the agent is invoked the backend captures UI evidence from `demo/verifier-sandbox` (or a project specific harness), stores a screenshot + diff summary artifact, and feeds it into the verifier prompt. Run `demo/verifier-sandbox/capture.sh` to regenerate screenshots (uses Playwright when available and falls back to an in-repo PNG generator so CI still passes).
+- Tasks have a first-class Acceptance Criteria checklist. Capture the requirements in the task sidebar, sync them to the verifier prompt automatically, and mark each line as satisfied once the evidence proves it.
+- The capture pipeline is overridable: set `VERIFIER_CAPTURE_COMMAND` to point at your own screenshot command, `VERIFIER_SANDBOX_ROOT` to point at the directory containing `verifier-sandbox` (defaults to this repo’s `demo/verifier-sandbox`), or `VERIFIER_DISABLE_PLAYWRIGHT=1` to force the fallback PNG generator when Playwright dependencies are unavailable.
+- Spec verification leans on a Playwright + Gemini automation harness. `demo/verifier-sandbox/automation.mjs` boots Chromium against `VERIFIER_AUTOMATION_URL` (defaults to the bundled `demo.html`), lets Gemini reason about each screenshot to decide the next click, and emits `automation-report.json`, `automation-log.json`, and the final screenshot (`current.png`). Configure `VERIFIER_MAX_STEPS` to control how many decisions Gemini is allowed to make per run.
+- The backend stores `automation-report.json` as an `ArtifactVerifierReport` and only falls back to the Gemini screenshot reviewer when no automation verdict is available. Configure `GEMINI_API_KEY` (and optionally `GEMINI_MODEL`, e.g. `gemini-1.5-pro`) so both the sandbox driver and the fallback reviewer can call the Generative Language API. For smoke tests or offline dev you can set `GEMINI_FAKE_MODE=1` to short-circuit both callers while keeping the workflow intact.
+- A background repo-sync monitor now keeps the default repo (and every active task branch) aligned with `origin/<baseBranch>`. Every `REPO_SYNC_INTERVAL_SECONDS` (default 60s) it fetches `origin`, merges the latest base branch into each `task/<id>` branch, reruns the configured test command, and pushes the branch when tests pass. Failures automatically schedule a fix iteration with the failing test log attached, so implementers can pick up regressions caused by upstream changes immediately. Set `REPO_SYNC_INTERVAL_SECONDS` to tune the cadence.
+- Repository-specific wiring lives in `config/repo-profiles.json`. Each profile can inject environment variables (e.g. `VERIFIER_AUTOMATION_URL`), override the verifier sandbox path/command, and run custom setup commands before evidence capture. The default profile targets `/nvme/medex` but reuses this repo’s bundled sandbox (`demo/verifier-sandbox`) to capture evidence; it launches the Medex Coding Copilot demo via `./scripts/run_coding_copilot_demo.sh start` and points the Playwright verifier at `http://127.0.0.1:5173/app/billing/modern`. Extend the JSON file (or set `REPO_PROFILES_PATH`) to onboard additional repos without code changes—only the preview URL and setup command need to differ.
+  - Repo profile env is passed through verbatim, so leave `GEMINI_FAKE_MODE` unset (or set to `0`) to get real Gemini verdicts, or set it to `1` in the profile/env when you need offline runs.
+
+## Repo Profiles
+
+- **Location:** `config/repo-profiles.json` (override with `REPO_PROFILES_PATH`).
+- **Fields:**
+  - `match`: canonical path (or parent directory) to match against `settingsDefaultRepoRoot`.
+  - `setup`: commands that must succeed before spec verification runs (designed for launching preview stacks). Commands run from `workingDir` (default: repo root) with optional `timeoutSeconds`.
+  - `sandbox` / `captureCommand`: overrides for the screenshot harness.
+  - `env`: key/value pairs injected into the capture pipeline (e.g. `VERIFIER_AUTOMATION_URL`).
+- The bundled Medex profile launches `scripts/launch_copilot_stack.sh` (a thin wrapper around `scripts/run_coding_copilot_demo.sh`) so the backend, worker, and frontend are live before the Playwright automation explores the UI. Stop the stack with `scripts/launch_copilot_stack.sh stop` when you’re done, or add your own repo profile pointing to a different script.
 
 ## Status
 

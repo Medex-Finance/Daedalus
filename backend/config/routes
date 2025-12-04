@@ -1,12 +1,15 @@
 /api/tasks                        TaskListR          GET POST
 /api/tasks/#TaskId                TaskR              GET PATCH
 /api/tasks/#TaskId/history        TaskHistoryR       GET
+/api/tasks/#TaskId/artifacts/#ArtifactId/file TaskArtifactFileR GET
 /api/tasks/#TaskId/test-command   TaskTestCommandR   PUT
+/api/tasks/#TaskId/criteria       TaskCriteriaR      PUT
 /api/tasks/#TaskId/qa/skip        TaskQaSkipR        POST
 /api/tasks/#TaskId/preview/start  TaskPreviewStartR  POST
 /api/tasks/#TaskId/cancel         TaskCancelR        POST
 /api/tasks/#TaskId/messages       TaskMessageR       POST
 /api/tasks/#TaskId/retry          TaskRetryR         POST
+/api/tasks/#TaskId/verifier/start TaskVerifierStartR POST
 /api/tasks/#TaskId/pause          TaskPauseR         POST
 /api/tasks/#TaskId/resume         TaskResumeR        POST
 /api/tasks/#TaskId/reassign       TaskReassignR      POST

@@ -13,6 +13,8 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Data.Time.Clock (getCurrentTime)
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.Directory (doesDirectoryExist)
+import System.Environment (lookupEnv)
 
 defaultTestCommand :: Text
 defaultTestCommand = "./scripts/run-tests.sh"
@@ -44,10 +46,10 @@ ensureSettings pool = runSqlPool ensure pool
                   }
           pure (toDTO normalized)
         Nothing -> do
+          defaultRepo <- liftIO discoverDefaultRepoRoot
           now <- liftIO getCurrentTime
-          let repo = "."
           _ <- insert AppSettings
-                { appSettingsDefaultRepoRoot = repo
+                { appSettingsDefaultRepoRoot = defaultRepo
                 , appSettingsDefaultBranch = "main"
                 , appSettingsTestCommand = defaultTestCommand
                 , appSettingsPreviewCommand = Nothing
@@ -55,7 +57,7 @@ ensureSettings pool = runSqlPool ensure pool
                 , appSettingsUpdatedAt = now
                 }
           pure AppSettingsDTO
-                { settingsDefaultRepoRoot = repo
+                { settingsDefaultRepoRoot = defaultRepo
                 , settingsDefaultBranch = "main"
                 , settingsTestCommand = defaultTestCommand
                 , settingsPreviewCommand = Nothing
@@ -114,3 +116,12 @@ toDTO AppSettings { appSettingsDefaultRepoRoot, appSettingsDefaultBranch, appSet
         if appSettingsInactivityTimeoutMinutes <= 0 then defaultInactivityMinutes else appSettingsInactivityTimeoutMinutes
     , settingsUpdatedAt = appSettingsUpdatedAt
     }
+
+discoverDefaultRepoRoot :: IO Text
+discoverDefaultRepoRoot = do
+  envOverride <- lookupEnv "DEFAULT_REPO_ROOT"
+  case envOverride of
+    Just path -> pure (T.pack path)
+    Nothing -> do
+      medexExists <- doesDirectoryExist "/nvme/medex"
+      pure $ if medexExists then "/nvme/medex" else "."

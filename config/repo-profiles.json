@@ -1,0 +1,19 @@
+[
+  {
+    "match": "/nvme/medex",
+    "name": "medex",
+    "sandbox": "/nvme/cursor_manager/demo/verifier-sandbox",
+    "captureCommand": null,
+    "env": {
+      "VERIFIER_AUTOMATION_URL": "http://127.0.0.1:5173/app/billing/modern"
+    },
+    "setup": [
+      {
+        "name": "medex-stack",
+        "command": "./scripts/run_coding_copilot_demo.sh start",
+        "workingDir": "/nvme/medex",
+        "timeoutSeconds": 600
+      }
+    ]
+  }
+]

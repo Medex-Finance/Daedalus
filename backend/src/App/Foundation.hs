@@ -20,10 +20,11 @@ module App.Foundation
   , getFrontendIndexR
   ) where
 
-import App.Models (TaskId)
+import App.Models (ArtifactId, TaskId)
 import App.Queue (AppQueue)
 import App.StatusStream (StatusHub)
 import App.Types (AgentRole, AppSettingsDTO, PromptTemplateDTO, WorkflowStep)
+import App.RepoProfiles (RepoProfiles)
 import Control.Concurrent.STM (TVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
@@ -97,6 +98,7 @@ data App = App
   , appStatic :: Static
   , appIndexFile :: FilePath
   , appWorkerCount :: Int
+  , appRepoProfiles :: RepoProfiles
   }
 
 instance Yesod App where

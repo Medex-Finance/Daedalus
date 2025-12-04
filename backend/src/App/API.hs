@@ -36,6 +36,7 @@ import App.Settings (updateSettings)
 import App.StatusStream (StatusEnvelope(..), subscribeStatus)
 import App.Types hiding (promptTemplateKey, taskStatus)
 import qualified App.Types as DTO
+import App.Worktree (WorktreeContext(..), locateWorktree)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -45,11 +46,12 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Applicative ((<|>))
-import Control.Monad (forever, when)
+import Control.Monad (forever, when, void)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (Value, object, (.=))
 import qualified Data.Aeson as Aeson
-import Data.List (splitAt)
+import Data.List (isPrefixOf, splitAt)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -64,10 +66,12 @@ import Database.Persist
   ( Entity(..)
   , Key
   , SelectOpt(..)
+  , deleteWhere
   , entityKey
   , entityVal
   , get
   , insert
+  , insert_
   , selectList
   , update
   , (=.)
@@ -76,6 +80,9 @@ import Database.Persist
   )
 import Database.Persist.Sql (SqlPersistT, fromSqlKey, toSqlKey)
 import Network.HTTP.Types.Status (status400)
+import Network.Mime (defaultMimeLookup)
+import System.Directory (canonicalizePath, doesFileExist)
+import System.FilePath (addTrailingPathSeparator)
 import Yesod
 import Yesod.Core (sendChunkText, sendFlush)
 
@@ -119,31 +126,9 @@ postTaskListR = do
 
 getTaskR :: TaskId -> Handler Value
 getTaskR taskId = do
-  App {..} <- getYesod
-  defaults <- liftIO $ readTVarIO appSettingsVar
-  pausedSet <- liftIO $ readTVarIO appPausedTasks
-  snoozedMap <- liftIO $ readTVarIO appSnoozedTasks
-  mTask <- runDB $ get taskId
-  case mTask of
-    Nothing -> notFound
-    Just task -> do
-      runs <- runDB $ selectList [TaskRunTaskId ==. taskId] [Desc TaskRunOrdinal]
-      (eventPage, nextCursor) <- runDB $ fetchEventPage taskId Nothing
-      artifacts <- runDB $ selectList [ArtifactTaskId ==. taskId] [Desc ArtifactCreatedAt]
-      let overrideCmd = taskTestCommandOverride task
-          effectiveCmd = fromMaybe (settingsTestCommand defaults) overrideCmd
-      let detail = TaskDetail
-            { taskDetailSummary = taskSummaryFromEntity pausedSet snoozedMap (Entity taskId task)
-            , taskDetailRuns = fmap taskRunToInfo runs
-            , taskDetailEvents = fmap statusEventToDTO eventPage
-            , taskDetailArtifacts = fmap artifactToDTO artifacts
-            , taskDetailTestCommand = effectiveCmd
-            , taskDetailTestCommandOverride = overrideCmd
-            , taskDetailIsPaused = Set.member taskId pausedSet
-            , taskDetailSnoozeUntil = Map.lookup taskId snoozedMap
-            , taskDetailEventNextCursor = fmap fromSqlKey nextCursor
-            }
-      returnJson detail
+  app <- getYesod
+  detail <- loadTaskDetail app taskId
+  returnJson detail
 
 eventPageSize :: Int
 eventPageSize = 200
@@ -184,6 +169,27 @@ getTaskHistoryR taskId = do
             , taskHistoryNextCursor = fmap fromSqlKey nextCursor
             }
       returnJson page
+
+getTaskArtifactFileR :: TaskId -> ArtifactId -> Handler TypedContent
+getTaskArtifactFileR taskId artifactId = do
+  mArtifact <- runDB $ get artifactId
+  case mArtifact of
+    Nothing -> notFound
+    Just artifact@Artifact { artifactTaskId = ownerTaskId, artifactPath = mPath } -> do
+      when (ownerTaskId /= taskId) notFound
+      case mPath of
+        Nothing -> notFound
+        Just pathTxt -> do
+          mTask <- runDB $ get taskId
+          case mTask of
+            Nothing -> notFound
+            Just task -> do
+              resolution <- liftIO $ resolveArtifactPath taskId task (T.unpack pathTxt)
+              case resolution of
+                Left err -> sendResponseStatus status400 (object ["error" .= err])
+                Right filePath -> do
+                  let mime = defaultMimeLookup (T.pack filePath)
+                  sendFile mime filePath
 
 patchTaskR :: TaskId -> Handler Value
 patchTaskR taskId = do
@@ -246,9 +252,12 @@ postTaskPreviewStartR taskId = do
   app@App { appConnPool } <- getYesod
   outcome <- liftIO $ startPreview app taskId
   case outcome of
-    Left err -> sendResponseStatus status400 (object ["error" .= err])
+    Left err -> do
+      liftIO $ logEvent app taskId StepPreview "Preview failed to start" (Just $ object ["error" .= err])
+      sendResponseStatus status400 (object ["error" .= err])
     Right url -> do
-      liftIO $ logEvent app taskId StepPreview "Preview launch requested manually" (Just $ object ["url" .= url])
+      liftIO $ logEvent app taskId StepPreview "Preview launch requested manually"
+        (Just $ object ["url" .= url, "status" .= ("healthy" :: Text)])
       liftIO $ enqueueTaskStep app taskId StepFinalize
       getTaskR taskId
 
@@ -280,6 +289,45 @@ postTaskRetryR taskId = do
   case outcome of
     Left err -> sendResponseStatus status400 (object ["error" .= err])
     Right step -> returnJson (object ["requeuedStep" .= step])
+
+postTaskVerifierStartR :: TaskId -> Handler Value
+postTaskVerifierStartR taskId = do
+  app <- getYesod
+  now <- liftIO getCurrentTime
+  mTask <- runDB $ get taskId
+  case mTask of
+    Nothing -> sendResponseStatus status400 (object ["error" .= ("Task not found" :: Text)])
+    Just _ -> do
+      -- clear paused state so the verifier can actually run
+      liftIO $ resumeTask app taskId
+      liftIO $ runSqlPool
+        (do
+          existingRun <- selectFirst [TaskRunTaskId ==. taskId] [Desc TaskRunOrdinal]
+          let ord = maybe 1 ((+ 1) . App.Models.taskRunOrdinal . entityVal) existingRun
+              updateRun (Entity runId _) =
+                update runId
+                  [ TaskRunCurrentStep =. StepSpecVerification
+                  , TaskRunUpdatedAt =. now
+                  ]
+          case existingRun of
+            Nothing ->
+              void $ insert TaskRun
+                { taskRunTaskId = taskId
+                , taskRunOrdinal = ord
+                , taskRunCurrentStep = StepSpecVerification
+                , taskRunPmSummary = Nothing
+                , taskRunCreatedAt = now
+                , taskRunUpdatedAt = now
+                }
+            Just runEnt -> updateRun runEnt
+          update taskId
+            [ TaskStatus =. TaskStatusImplementing
+            , TaskUpdatedAt =. now
+            ]
+        ) (appConnPool app)
+      liftIO $ logEvent app taskId StepSpecVerification "Manual verifier start requested" (withOrigin "human" Nothing)
+      liftIO $ enqueueTaskStep app taskId StepSpecVerification
+      getTaskR taskId
 
 postTaskPauseR :: TaskId -> Handler Value
 postTaskPauseR taskId = do
@@ -443,9 +491,10 @@ statusEventToDTO (Entity key StatusEvent { statusEventStep = step, statusEventMe
     }
 
 artifactToDTO :: Entity Artifact -> ArtifactDTO
-artifactToDTO (Entity _ Artifact { artifactKind = kind, artifactLabel = label, artifactContent = content, artifactPath = path, artifactCreatedAt = created }) =
+artifactToDTO (Entity key Artifact { artifactKind = kind, artifactLabel = label, artifactContent = content, artifactPath = path, artifactCreatedAt = created }) =
   ArtifactDTO
-    { artifactKind = kind
+    { artifactId = fromSqlKey key
+    , artifactKind = kind
     , artifactLabel = label
     , artifactBody = content
     , artifactPath = path
@@ -474,3 +523,88 @@ taskRunToInfo (Entity _ TaskRun { taskRunOrdinal = ord, taskRunCurrentStep = ste
 
 showText :: Show a => a -> Text
 showText = T.pack . show
+
+loadTaskDetail :: App -> TaskId -> Handler TaskDetail
+loadTaskDetail app@App {..} taskId = do
+  defaults <- liftIO $ readTVarIO appSettingsVar
+  pausedSet <- liftIO $ readTVarIO appPausedTasks
+  snoozedMap <- liftIO $ readTVarIO appSnoozedTasks
+  mTask <- runDB $ get taskId
+  case mTask of
+    Nothing -> notFound
+    Just task -> do
+      runs <- runDB $ selectList [TaskRunTaskId ==. taskId] [Desc TaskRunOrdinal]
+      (eventPage, nextCursor) <- runDB $ fetchEventPage taskId Nothing
+      artifacts <- runDB $ selectList [ArtifactTaskId ==. taskId] [Desc ArtifactCreatedAt]
+      criteria <- runDB $ selectList [TaskAcceptanceCriterionTaskId ==. taskId] [Asc TaskAcceptanceCriterionOrdinal]
+      let overrideCmd = taskTestCommandOverride task
+          effectiveCmd = fromMaybe (settingsTestCommand defaults) overrideCmd
+      pure TaskDetail
+        { taskDetailSummary = taskSummaryFromEntity pausedSet snoozedMap (Entity taskId task)
+        , taskDetailRuns = fmap taskRunToInfo runs
+        , taskDetailEvents = fmap statusEventToDTO eventPage
+        , taskDetailArtifacts = fmap artifactToDTO artifacts
+        , taskDetailCriteria = fmap criterionToDTO criteria
+        , taskDetailTestCommand = effectiveCmd
+        , taskDetailTestCommandOverride = overrideCmd
+        , taskDetailIsPaused = Set.member taskId pausedSet
+        , taskDetailSnoozeUntil = Map.lookup taskId snoozedMap
+        , taskDetailEventNextCursor = fmap fromSqlKey nextCursor
+        }
+
+resolveArtifactPath :: TaskId -> Task -> FilePath -> IO (Either Text FilePath)
+resolveArtifactPath taskId task storedPath = do
+  let repoRootRaw = T.unpack (taskRepoRoot task)
+      repoBase = if null repoRootRaw then "." else repoRootRaw
+  exists <- doesFileExist storedPath
+  if not exists
+    then pure $ Left "Artifact file missing on disk"
+    else do
+      canonicalTarget <- canonicalizePath storedPath
+      repoCanonical <- canonicalizePath repoBase
+      WorktreeContext { wtRoot } <- locateWorktree repoBase taskId
+      canonicalWorktree <- canonicalizePath wtRoot
+      let allowed = dedupe [repoCanonical, canonicalWorktree]
+      if any (`isWithin` canonicalTarget) allowed
+        then pure (Right canonicalTarget)
+        else pure $ Left "Artifact path is outside the allowed repository directories"
+  where
+    dedupe = foldr (\item acc -> if item `elem` acc then acc else item : acc) []
+
+isWithin :: FilePath -> FilePath -> Bool
+isWithin parent child =
+  let parent' = addTrailingPathSeparator parent
+      child' = addTrailingPathSeparator child
+   in parent' `isPrefixOf` child'
+
+criterionToDTO :: Entity TaskAcceptanceCriterion -> AcceptanceCriterionDTO
+criterionToDTO (Entity key TaskAcceptanceCriterion { taskAcceptanceCriterionBody = body, taskAcceptanceCriterionIsMet = isMet, taskAcceptanceCriterionOrdinal = ord }) =
+  AcceptanceCriterionDTO
+    { criterionId = fromSqlKey key
+    , criterionBody = body
+    , criterionIsMet = isMet
+    , criterionOrdinal = ord
+    }
+putTaskCriteriaR :: TaskId -> Handler Value
+putTaskCriteriaR taskId = do
+  app@App {..} <- getYesod
+  TaskCriteriaUpdateRequest { taskCriteriaItems } <- requireCheckJsonBody
+  now <- liftIO getCurrentTime
+  let sanitized =
+        [ item
+        | item@TaskCriterionInput { criterionBody = body } <- taskCriteriaItems
+        , not (T.null (T.strip body))
+        ]
+  runDB $ do
+    deleteWhere [TaskAcceptanceCriterionTaskId ==. taskId]
+    for_ (zip [1..] sanitized) $ \(ord, TaskCriterionInput { criterionBody, criterionIsMet }) ->
+      insert_ TaskAcceptanceCriterion
+        { taskAcceptanceCriterionTaskId = taskId
+        , taskAcceptanceCriterionOrdinal = ord
+        , taskAcceptanceCriterionBody = T.strip criterionBody
+        , taskAcceptanceCriterionIsMet = criterionIsMet
+        , taskAcceptanceCriterionCreatedAt = now
+        , taskAcceptanceCriterionUpdatedAt = now
+        }
+  detail <- loadTaskDetail app taskId
+  returnJson detail

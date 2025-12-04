@@ -1,0 +1,13 @@
+{
+  "name": "verifier-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs",
+    "capture:reference": "node capture.mjs --output reference.png"
+  },
+  "dependencies": {
+    "playwright": "1.54.1"
+  }
+}

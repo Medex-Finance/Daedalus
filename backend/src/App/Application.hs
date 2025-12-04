@@ -14,6 +14,7 @@ import App.PromptStore (ensurePromptTemplates)
 import App.Queue (newQueue)
 import App.Settings (ensureSettings)
 import App.StatusStream (newStatusHub)
+import App.RepoProfiles (loadRepoProfiles)
 import Control.Concurrent.STM (newTVarIO)
 import Control.Monad.Logger (runStdoutLoggingT)
 import Data.Maybe (fromMaybe)
@@ -63,6 +64,7 @@ makeApp = do
       indexFile = staticDir </> "index.html"
   createDirectoryIfMissing True fallbackStaticDir
   staticSite <- static staticDir
+  repoProfiles <- loadRepoProfiles
   let appFoundation = App
         { appConnPool = pool
         , appManager = manager
@@ -82,6 +84,7 @@ makeApp = do
         , appStatic = staticSite
         , appIndexFile = indexFile
         , appWorkerCount = workerCount
+        , appRepoProfiles = repoProfiles
         }
   startOrchestrator appFoundation
   pure appFoundation
