@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "../scripts/generate-types.sh",
     "dev": "vite",
+    "prebuild": "../scripts/generate-types.sh",
     "build": "vite build",
     "preview": "vite preview"
   },

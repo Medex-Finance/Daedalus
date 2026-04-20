@@ -1,2 +1,4 @@
 packages: backend
 
+constraints:
+  yesod-static ==1.6.1.0

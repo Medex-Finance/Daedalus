@@ -13,15 +13,15 @@
           inherit system;
           config.allowUnfree = true;
         };
-        haskellPackages = pkgs.haskellPackages;
-        backendPkg = haskellPackages.callCabal2nix "orchestrator-backend" ./backend { };
+        haskellPackages = pkgs.haskell.packages.ghc984;
         frontendPkg = pkgs.stdenv.mkDerivation {
           pname = "orchestrator-frontend";
           version = "0.1.0";
           src = ./frontend;
-          buildInputs = [ pkgs.nodejs_20 pkgs.pnpm ];
+          buildInputs = [ pkgs.nodejs_20 pkgs.pnpm pkgs.elmPackages.elm ];
           buildPhase = ''
             export NODE_OPTIONS=--openssl-legacy-provider
+            export ELM_BINARY=${pkgs.elmPackages.elm}/bin/elm
             pnpm install --frozen-lockfile || pnpm install
             pnpm build
           '';
@@ -33,9 +33,8 @@
       in
       {
         packages = {
-          backend = backendPkg;
           frontend = frontendPkg;
-          default = backendPkg;
+          default = frontendPkg;
         };
 
         devShells.default = pkgs.mkShell {
@@ -43,16 +42,17 @@
             pkgs.git
             pkgs.nodejs_20
             pkgs.pnpm
+            pkgs.elmPackages.elm
             pkgs.sqlite
             pkgs.zlib
             pkgs.zlib.dev
             pkgs.watchman
             pkgs.cabal-install
-            pkgs.haskellPackages.ghc
-            pkgs.haskellPackages.haskell-language-server
-            pkgs.haskellPackages.ormolu
-            pkgs.haskellPackages.aeson-typescript
-            pkgs.haskellPackages.fast-logger
+            haskellPackages.ghc
+            haskellPackages.haskell-language-server
+            haskellPackages.ormolu
+            haskellPackages.aeson-typescript
+            haskellPackages.fast-logger
             # Playwright runtime deps + managed browsers
             pkgs.playwright-driver.browsers
             pkgs.chromium
@@ -67,17 +67,18 @@
             pkgs.libdrm
             pkgs.udev
             pkgs.libxkbcommon
-            pkgs.xorg.libX11
-            pkgs.xorg.libXcomposite
-            pkgs.xorg.libXdamage
-            pkgs.xorg.libXext
-            pkgs.xorg.libXfixes
-            pkgs.xorg.libXrandr
-            pkgs.xorg.libxcb
+            pkgs.libx11
+            pkgs.libxcomposite
+            pkgs.libxdamage
+            pkgs.libxext
+            pkgs.libxfixes
+            pkgs.libxrandr
+            pkgs.libxcb
           ];
           shellHook = ''
             export CABAL_DIR=$PWD/dist-newstyle
             export PATH=$PWD/node_modules/.bin:$PATH
+            export ELM_BINARY=${pkgs.elmPackages.elm}/bin/elm
             export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
             export CHROMIUM_PATH=$(find ${pkgs.playwright-driver.browsers} -path '*chrome-linux/chrome' -type f -print -quit)

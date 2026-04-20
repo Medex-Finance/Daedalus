@@ -111,7 +111,9 @@ executable generate-types
       base
     , orchestrator-types
     , aeson-typescript
+    , directory
     , elm-bridge
+    , filepath
     , text
   default-language:  Haskell2010
 

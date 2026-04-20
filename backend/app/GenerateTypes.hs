@@ -5,7 +5,9 @@ import Data.Aeson.TypeScript.TH (TypeScript(..), formatTSDeclarations)
 import Data.Proxy (Proxy(..))
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.IO as TLIO
+import System.Directory (createDirectoryIfMissing)
 import System.Environment (getArgs)
+import System.FilePath (takeDirectory)
 
 import Elm.Module (makeElmModule)
 
@@ -59,8 +61,71 @@ main = do
               "jsonDecTaskRedirectRequest =\n   Json.Decode.succeed (\\ptaskRedirectTargetTaskId -> {taskRedirectTargetTaskId = ptaskRedirectTargetTaskId}) |> custom (Json.Decode.int)\n"
               "jsonDecTaskRedirectRequest =\n   Json.Decode.succeed (\\ptaskRedirectTargetTaskId -> {taskRedirectTargetTaskId = ptaskRedirectTargetTaskId})\n   |> required \"taskRedirectTargetTaskId\" (Json.Decode.int)\n"
               withRetryDecoder
+            withWorkerStatusStateDecoder =
+              TL.replace
+                "Json.Decode.map WorkerStatusIdle (   Json.Decode.succeed WorkerStatusStateDTO    |> required \"workerStatusIdleSince\" (jsonDecPosix))"
+                "Json.Decode.map WorkerStatusIdle (   Json.Decode.succeed (\\pworkerStatusIdleSince -> {workerStatusIdleSince = pworkerStatusIdleSince})    |> required \"workerStatusIdleSince\" (jsonDecPosix))"
+              $ TL.replace
+                "Json.Decode.map WorkerStatusRunning (   Json.Decode.succeed WorkerStatusStateDTO    |> required \"workerStatusTaskId\" (Json.Decode.int)    |> fnullable \"workerStatusTaskTitle\" (Json.Decode.string)    |> required \"workerStatusStep\" (jsonDecWorkflowStep)    |> required \"workerStatusStartedAt\" (jsonDecPosix))"
+                "Json.Decode.map WorkerStatusRunning (   Json.Decode.succeed (\\pworkerStatusTaskId pworkerStatusTaskTitle pworkerStatusStep pworkerStatusStartedAt -> {workerStatusTaskId = pworkerStatusTaskId, workerStatusTaskTitle = pworkerStatusTaskTitle, workerStatusStep = pworkerStatusStep, workerStatusStartedAt = pworkerStatusStartedAt})    |> required \"workerStatusTaskId\" (Json.Decode.int)    |> fnullable \"workerStatusTaskTitle\" (Json.Decode.string)    |> required \"workerStatusStep\" (jsonDecWorkflowStep)    |> required \"workerStatusStartedAt\" (jsonDecPosix))"
+                withRedirectDecoder
+            withUnaryRecordFixes =
+              foldl
+                (\acc (before, after) -> TL.replace before after acc)
+                withWorkerStatusStateDecoder
+                [ ( "jsonDecTaskUpdateStatusRequest =\n   Json.Decode.succeed TaskUpdateStatusRequest |> custom (jsonDecTaskStatus)\n"
+                  , "jsonDecTaskUpdateStatusRequest =\n   Json.Decode.succeed TaskUpdateStatusRequest\n   |> required \"taskStatus\" (jsonDecTaskStatus)\n"
+                  )
+                , ( "jsonEncTaskUpdateStatusRequest  val =\n   jsonEncTaskStatus val.taskStatus\n"
+                  , "jsonEncTaskUpdateStatusRequest  val =\n   Json.Encode.object\n   [ (\"taskStatus\", jsonEncTaskStatus val.taskStatus)\n   ]\n"
+                  )
+                , ( "jsonDecTaskTestCommandUpdateRequest =\n   Json.Decode.succeed TaskTestCommandUpdateRequest |> custom (Json.Decode.string)\n"
+                  , "jsonDecTaskTestCommandUpdateRequest =\n   Json.Decode.succeed TaskTestCommandUpdateRequest\n   |> fnullable \"taskTestCommand\" (Json.Decode.string)\n"
+                  )
+                , ( "jsonEncTaskTestCommandUpdateRequest  val =\n   (maybeEncode (Json.Encode.string)) val.taskTestCommand\n"
+                  , "jsonEncTaskTestCommandUpdateRequest  val =\n   Json.Encode.object\n   [ (\"taskTestCommand\", (maybeEncode (Json.Encode.string)) val.taskTestCommand)\n   ]\n"
+                  )
+                , ( "jsonDecTaskCriteriaUpdateRequest =\n   Json.Decode.succeed TaskCriteriaUpdateRequest |> custom (Json.Decode.list (jsonDecTaskCriterionInput))\n"
+                  , "jsonDecTaskCriteriaUpdateRequest =\n   Json.Decode.succeed TaskCriteriaUpdateRequest\n   |> required \"taskCriteriaItems\" (Json.Decode.list (jsonDecTaskCriterionInput))\n"
+                  )
+                , ( "jsonEncTaskCriteriaUpdateRequest  val =\n   (Json.Encode.list jsonEncTaskCriterionInput) val.taskCriteriaItems\n"
+                  , "jsonEncTaskCriteriaUpdateRequest  val =\n   Json.Encode.object\n   [ (\"taskCriteriaItems\", (Json.Encode.list jsonEncTaskCriterionInput) val.taskCriteriaItems)\n   ]\n"
+                  )
+                , ( "jsonDecPromptResetRequest =\n   Json.Decode.succeed PromptResetRequest |> custom (Json.Decode.string)\n"
+                  , "jsonDecPromptResetRequest =\n   Json.Decode.succeed PromptResetRequest\n   |> required \"promptResetKey\" (Json.Decode.string)\n"
+                  )
+                , ( "jsonEncPromptResetRequest  val =\n   Json.Encode.string val.promptResetKey\n"
+                  , "jsonEncPromptResetRequest  val =\n   Json.Encode.object\n   [ (\"promptResetKey\", Json.Encode.string val.promptResetKey)\n   ]\n"
+                  )
+                , ( "jsonDecTaskRetryRequest =\n   Json.Decode.succeed TaskRetryRequest |> custom (Json.Decode.string)\n"
+                  , "jsonDecTaskRetryRequest =\n   Json.Decode.succeed TaskRetryRequest\n   |> fnullable \"taskRetryInstructions\" (Json.Decode.string)\n"
+                  )
+                , ( "jsonEncTaskRetryRequest  val =\n   (maybeEncode (Json.Encode.string)) val.taskRetryInstructions\n"
+                  , "jsonEncTaskRetryRequest  val =\n   Json.Encode.object\n   [ (\"taskRetryInstructions\", (maybeEncode (Json.Encode.string)) val.taskRetryInstructions)\n   ]\n"
+                  )
+                , ( "jsonDecTaskRedirectRequest =\n   Json.Decode.succeed TaskRedirectRequest |> custom (Json.Decode.int)\n"
+                  , "jsonDecTaskRedirectRequest =\n   Json.Decode.succeed TaskRedirectRequest\n   |> required \"taskRedirectTargetTaskId\" (Json.Decode.int)\n"
+                  )
+                , ( "jsonEncTaskRedirectRequest  val =\n   Json.Encode.int val.taskRedirectTargetTaskId\n"
+                  , "jsonEncTaskRedirectRequest  val =\n   Json.Encode.object\n   [ (\"taskRedirectTargetTaskId\", Json.Encode.int val.taskRedirectTargetTaskId)\n   ]\n"
+                  )
+                , ( "jsonDecTaskSnoozeRequest =\n   Json.Decode.succeed TaskSnoozeRequest |> custom (Json.Decode.int)\n"
+                  , "jsonDecTaskSnoozeRequest =\n   Json.Decode.succeed TaskSnoozeRequest\n   |> required \"taskSnoozeMinutes\" (Json.Decode.int)\n"
+                  )
+                , ( "jsonEncTaskSnoozeRequest  val =\n   Json.Encode.int val.taskSnoozeMinutes\n"
+                  , "jsonEncTaskSnoozeRequest  val =\n   Json.Encode.object\n   [ (\"taskSnoozeMinutes\", Json.Encode.int val.taskSnoozeMinutes)\n   ]\n"
+                  )
+                , ( "jsonDecTaskSnoozeStatus =\n   Json.Decode.succeed TaskSnoozeStatus |> custom (jsonDecPosix)\n"
+                  , "jsonDecTaskSnoozeStatus =\n   Json.Decode.succeed TaskSnoozeStatus\n   |> fnullable \"taskSnoozeUntil\" (jsonDecPosix)\n"
+                  )
+                , ( "jsonEncTaskSnoozeStatus  val =\n   (maybeEncode (jsonEncPosix)) val.taskSnoozeUntil\n"
+                  , "jsonEncTaskSnoozeStatus  val =\n   Json.Encode.object\n   [ (\"taskSnoozeUntil\", (maybeEncode (jsonEncPosix)) val.taskSnoozeUntil)\n   ]\n"
+                  )
+                ]
             helperBlock = TL.pack "\njsonDecPosix : Json.Decode.Decoder Posix\njsonDecPosix =\n    Json.Decode.string\n        |> Json.Decode.andThen\n            (\\str ->\n                case Iso8601.toTime str of\n                    Ok posix ->\n                        Json.Decode.succeed posix\n\n                    Err _ ->\n                        Json.Decode.fail \"Invalid ISO8601 timestamp\"\n            )\n\njsonEncPosix : Posix -> Value\njsonEncPosix posix =\n    Json.Encode.string (Iso8601.fromTime posix)\n\njsonDecValue : Json.Decode.Decoder Value\njsonDecValue =\n    Json.Decode.value\n\njsonEncValue : Value -> Value\njsonEncValue value =\n    value\n\n"
-        in TL.replace "import Set exposing (Set)\n\n" ("import Set exposing (Set)\n\n" <> helperBlock) withRedirectDecoder
+        in TL.replace "import Set exposing (Set)\n\n" ("import Set exposing (Set)\n\n" <> helperBlock) withUnaryRecordFixes
+  createDirectoryIfMissing True (takeDirectory tsPath)
+  createDirectoryIfMissing True (takeDirectory elmPath)
   TLIO.writeFile tsPath (tsHeader <> TL.pack (formatTSDeclarations decls))
   TLIO.writeFile elmPath (TL.pack "-- AUTO-GENERATED by backend/app/GenerateTypes.hs\n\n" <> elmModule)
   putStrLn $ "Type declarations written to " <> tsPath
